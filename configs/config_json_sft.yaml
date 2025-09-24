@@ -14,11 +14,6 @@ parameterization: subs  # subs / d3pm / sedd
 time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
-variable_length: True
-start_with_bos_token: True
-ends_with_eos_token: True
-modeling_unmask: True
-modeling_unmask_layer: concat  # add / concat
 
 # Json generation configurations
 chat_template_training: True  # Enable chat template training mode
@@ -26,6 +21,7 @@ json_structure_token_masking: True  # Mask JSON structure tokens (exclude from t
 json_structure_token_prompting: True  # Use JSON structure tokens as part of the input prompt during evaluation
 block_json_structure_token: True  # Logit masking for JSON structure tokens during training
 use_endofjson_token: True
+ignore_validate_schema: True  # Ignore schema validation when computing json correctness during evaluation
 
 seed: 2
 
@@ -66,8 +62,6 @@ eval:
   generate_samples: True
 
 optim:
-  # weight_decay: 0
-  # lr: 3e-4
   weight_decay: 0.01
   lr: 1e-4
   beta1: 0.9

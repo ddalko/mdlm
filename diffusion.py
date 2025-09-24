@@ -23,6 +23,37 @@ from json_utils import JSON_STRUCTURE_TOKEN_IDS
 LOG2 = math.log(2)
 
 
+class DDitFinalLayer(torch.nn.Module):
+  def __init__(self, hidden_size, out_channels, cond_dim):
+    super().__init__()
+    self.norm_final = torch.nn.LayerNorm(hidden_size, bias=False)  # Match HuggingFace model structure
+    self.linear = torch.nn.Linear(hidden_size, out_channels)
+    self.linear.weight.data.zero_()
+    self.linear.bias.data.zero_()
+
+    self.adaLN_modulation = torch.nn.Linear(cond_dim,
+                                      2 * hidden_size,
+                                      bias=True)
+    self.adaLN_modulation.weight.data.zero_()
+    self.adaLN_modulation.bias.data.zero_()
+  
+    self.blocked_token_ids = JSON_STRUCTURE_TOKEN_IDS
+    blocked = torch.zeros(out_channels, dtype=torch.float32)
+    if self.blocked_token_ids:
+      blocked[torch.tensor(self.blocked_token_ids, dtype=torch.long)] = float("-inf")
+    self.register_buffer("blocked_mask", blocked)
+
+  def forward(self, x, c):
+    # Modulate with conditioning
+    shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
+    # Apply modulation (assuming modulate_fused function exists or implementing basic version)
+    x = self.norm_final(x) * (1 + scale) + shift
+    x = self.linear(x)
+    if self.blocked_token_ids is not None and hasattr(self, 'blocked_mask') and self.blocked_mask.any():
+      return x + self.blocked_mask.to(x.device)
+    return x
+
+
 def _sample_categorical(categorical_probs):
   gumbel_norm = (
     1e-10
@@ -114,8 +145,27 @@ class Diffusion(L.LightningModule):
         vocab_size=self.vocab_size,
         mask_index=self.mask_index)
     elif self.config.backbone == 'hf_dit':
+      # 항상 기본 모델로 초기화 (Lightning load_from_checkpoint가 나중에 가중치를 덮어씀)
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
-        config.eval.checkpoint_path, trust_remote_code=True)
+        'kuleshov-group/mdlm-owt', trust_remote_code=True)
+      
+      # Replace final layer with custom DDitFinalLayer that blocks JSON structure tokens
+      if hasattr(self.backbone, 'backbone') and hasattr(self.backbone.backbone, 'output_layer'):
+        original_final = self.backbone.backbone.output_layer
+        hidden_size = original_final.linear.in_features
+        out_channels = original_final.linear.out_features
+        cond_dim = original_final.adaLN_modulation.in_features
+        
+        # Create new final layer with blocking
+        new_final_layer = DDitFinalLayer(hidden_size, out_channels, cond_dim)
+        
+        # Copy weights from original layer
+        new_final_layer.norm_final.load_state_dict(original_final.norm_final.state_dict())
+        new_final_layer.linear.load_state_dict(original_final.linear.state_dict())
+        new_final_layer.adaLN_modulation.load_state_dict(original_final.adaLN_modulation.state_dict())
+        
+        # Replace the output layer
+        self.backbone.backbone.output_layer = new_final_layer
     else:
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
@@ -179,6 +229,15 @@ class Diffusion(L.LightningModule):
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
       self.ema.load_state_dict(checkpoint['ema'])
+
+    state_dict = checkpoint.get('state_dict', {})
+    if hasattr(self.backbone, 'output_layer'):
+      blocked_mask_key = 'backbone.output_layer.blocked_mask'
+      if blocked_mask_key not in state_dict:
+        print(f"Warning: {blocked_mask_key} not found in checkpoint. Using default empty mask.")
+        # Set strict=False for this checkpoint to avoid missing key errors
+        checkpoint['strict'] = False
+
     # Copied from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
     self.fast_forward_epochs = checkpoint['loops'][
@@ -186,6 +245,19 @@ class Diffusion(L.LightningModule):
     self.fast_forward_batches = checkpoint['loops'][
       'fit_loop']['epoch_loop.batch_progress'][
         'current']['completed']
+
+  def load_state_dict(self, state_dict, strict=True):
+    """
+    Override to handle backward compatibility with models that don't have blocked_mask.
+    """
+    # Check for missing blocked_mask
+    if hasattr(self.backbone, 'output_layer'):
+      blocked_mask_key = 'backbone.output_layer.blocked_mask'
+      if blocked_mask_key not in state_dict:
+        print(f"Warning: {blocked_mask_key} not found in state_dict. Loading with strict=False.")
+        strict = False
+    
+    return super().load_state_dict(state_dict, strict=strict)
 
   def on_save_checkpoint(self, checkpoint):
     if self.ema:
@@ -373,7 +445,16 @@ class Diffusion(L.LightningModule):
       attention_mask = batch['attention_mask']
     else:
       attention_mask = None
-    losses = self._loss(batch['input_ids'], attention_mask)
+    
+    # Extract prompt_mask and json_structure_mask if available
+    prompt_mask = None
+    json_structure_mask = None
+    if 'prompt_mask' in batch:
+      prompt_mask = batch['prompt_mask']
+    if 'json_structure_mask' in batch:
+      json_structure_mask = batch['json_structure_mask']
+      
+    losses = self._loss(batch['input_ids'], attention_mask, prompt_mask, json_structure_mask)
     loss = losses.loss
 
     if prefix == 'train':
@@ -593,10 +674,12 @@ class Diffusion(L.LightningModule):
     """
     move_indices = torch.rand(
       * x.shape, device=x.device) < move_chance
+    
     if prompt_mask is not None:
-      move_indices |= ~prompt_mask.bool()
+      move_indices &= ~prompt_mask.bool()  # Keep prompt tokens fixed
     if json_structure_mask is not None:
-      move_indices |= ~json_structure_mask.bool()
+      move_indices &= ~json_structure_mask.bool()  # Keep JSON structure tokens fixed
+      
     xt = torch.where(move_indices, self.mask_index, x)
     return xt
 
@@ -605,7 +688,7 @@ class Diffusion(L.LightningModule):
       * batch_dims, dtype=torch.int64)
 
   @torch.no_grad()
-  def _sample_json(self, prompt_tokens, json_structure_tokens=None, max_length=None, num_steps=None, eps=1e-5):
+  def _sample_json(self, prompt_tokens, prompt_masks, json_structure_masks=None, max_length=None, num_steps=None, eps=1e-5):
     """Generate samples from the model with a fixed prompt and optional JSON structure tokens.
     
     Args:
@@ -630,7 +713,15 @@ class Diffusion(L.LightningModule):
       num_steps = self.config.sampling.steps
       
     batch_size = prompt_tokens.shape[0]
-    prompt_length = prompt_tokens.shape[1]
+    
+    # Use prompt_masks to determine prompt length and positions
+    if prompt_masks is not None:
+      prompt_masks = prompt_masks.to(self.device)
+      # prompt_masks is a boolean tensor indicating prompt token positions
+      prompt_length = prompt_masks.sum(dim=1).max().item()  # Get maximum prompt length in batch
+    else:
+      # Fallback to original method if prompt_masks not provided
+      prompt_length = (prompt_tokens != self.mask_index).sum()
     
     if prompt_length >= max_length:
       raise ValueError(f"Prompt length ({prompt_length}) must be less than max_length ({max_length})")
@@ -642,21 +733,48 @@ class Diffusion(L.LightningModule):
       dtype=torch.int64,
       device=self.device
     )
-    # Set the prompt tokens (they remain fixed throughout sampling)
-    x[:, :prompt_length] = prompt_tokens.to(self.device)
+    
+    # Set the prompt tokens using prompt_masks if available
+    if prompt_masks is not None:
+      # Ensure prompt_masks and prompt_tokens have compatible shapes
+      if prompt_masks.shape[1] <= prompt_tokens.shape[1]:
+        # Use prompt_masks to set only the relevant prompt tokens
+        prompt_positions = prompt_masks[:, :min(prompt_masks.shape[1], max_length)]
+        if prompt_positions.shape[1] <= max_length:
+          x[:, :prompt_positions.shape[1]][prompt_positions] = prompt_tokens[:, :prompt_positions.shape[1]][prompt_positions]
+    else:
+      # Fallback to original method
+      x[:, :prompt_length] = prompt_tokens.to(self.device)
     
     # Create mask to identify prompt positions (these won't be updated)
-    prompt_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
-    prompt_mask[:, :prompt_length] = True
+    if prompt_masks is not None:
+      prompt_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
+      if prompt_masks.shape[1] <= max_length:
+        prompt_mask[:, :prompt_masks.shape[1]] = prompt_masks[:, :max_length]
+    else:
+      prompt_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
+      prompt_mask[:, :prompt_length] = True
     
     # Handle JSON structure tokens if provided
     json_structure_mask = None
-    if json_structure_tokens is not None:
-      json_structure_tokens = json_structure_tokens.to(self.device)
-      # Create mask for JSON structure positions (non-mask tokens)
-      json_structure_mask = (json_structure_tokens != self.mask_index)
-      # Set JSON structure tokens in the sequence
-      x[json_structure_mask] = json_structure_tokens[json_structure_mask]
+    if json_structure_masks is not None:
+      json_structure_masks = json_structure_masks.to(self.device)
+      # json_structure_masks는 JSON 구조 토큰 위치를 나타내는 boolean mask
+      json_structure_mask = json_structure_masks
+      
+      # prompt_tokens(GT)에서 JSON 구조 토큰 위치의 값들을 x에 덮어쓰기
+      # prompt_tokens의 길이가 max_length와 같다고 가정
+      if prompt_tokens.shape[1] >= max_length:
+        # prompt_tokens이 max_length 이상이면 잘라서 사용
+        gt_tokens = prompt_tokens[:, :max_length].to(self.device)
+      else:
+        # prompt_tokens이 max_length보다 짧으면 패딩
+        gt_tokens = torch.full((batch_size, max_length), self.mask_index, 
+                              dtype=torch.int64, device=self.device)
+        gt_tokens[:, :prompt_tokens.shape[1]] = prompt_tokens.to(self.device)
+      
+      # JSON 구조 마스크에 해당하는 위치의 토큰들을 GT에서 복사
+      x[json_structure_mask] = gt_tokens[json_structure_mask]
     
     timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)
     dt = (1 - eps) / num_steps
@@ -677,11 +795,23 @@ class Diffusion(L.LightningModule):
         x_new = self._analytic_update(x, t, dt)
       
       # Keep prompt tokens fixed by restoring them after each update
-      x_new[prompt_mask] = prompt_tokens.to(self.device).flatten()
+      if prompt_masks is not None:
+        # Use GT tokens to restore prompt positions
+        if prompt_tokens.shape[1] >= max_length:
+          gt_tokens_for_prompt = prompt_tokens[:, :max_length].to(self.device)
+        else:
+          gt_tokens_for_prompt = torch.full((batch_size, max_length), self.mask_index, 
+                                          dtype=torch.int64, device=self.device)
+          gt_tokens_for_prompt[:, :prompt_tokens.shape[1]] = prompt_tokens.to(self.device)
+        x_new[prompt_mask] = gt_tokens_for_prompt[prompt_mask]
+      else:
+        # Fallback to original method
+        x_new[prompt_mask] = prompt_tokens.to(self.device).flatten()
       
       # Keep JSON structure tokens fixed if provided
-      if json_structure_tokens is not None:
-        x_new[json_structure_mask] = json_structure_tokens[json_structure_mask]
+      if json_structure_mask is not None:
+        # GT 토큰에서 JSON 구조 토큰 위치의 값들을 복원
+        x_new[json_structure_mask] = gt_tokens[json_structure_mask]
       
       x = x_new
 
@@ -695,11 +825,23 @@ class Diffusion(L.LightningModule):
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
       
       # Ensure prompt tokens remain fixed after final denoising
-      x[prompt_mask] = prompt_tokens.to(self.device).flatten()
+      if prompt_masks is not None:
+        # Use GT tokens to restore prompt positions
+        if prompt_tokens.shape[1] >= max_length:
+          gt_tokens_for_prompt = prompt_tokens[:, :max_length].to(self.device)
+        else:
+          gt_tokens_for_prompt = torch.full((batch_size, max_length), self.mask_index, 
+                                          dtype=torch.int64, device=self.device)
+          gt_tokens_for_prompt[:, :prompt_tokens.shape[1]] = prompt_tokens.to(self.device)
+        x[prompt_mask] = gt_tokens_for_prompt[prompt_mask]
+      else:
+        # Fallback to original method
+        x[prompt_mask] = prompt_tokens.to(self.device).flatten()
       
       # Ensure JSON structure tokens remain fixed after final denoising
-      if json_structure_tokens is not None:
-        x[json_structure_mask] = json_structure_tokens[json_structure_mask]
+      if json_structure_mask is not None:
+        # GT 토큰에서 JSON 구조 토큰 위치의 값들을 복원
+        x[json_structure_mask] = gt_tokens[json_structure_mask]
     
     return x
 
@@ -1163,3 +1305,30 @@ class Diffusion(L.LightningModule):
     self.backbone.train()
     self.noise.train()
     return sampling_steps, samples, sequence_lengths
+
+  def restore_model_and_sample_with_prompt(self, prompt_tokens, prompt_masks, json_structure_masks, num_steps, eps=1e-5):
+    """Generate samples from the model with fixed prompt tokens."""
+    # Lightning auto-casting is not working in this method for some reason
+    if self.ema:
+      self.ema.store(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+      self.ema.copy_to(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+    
+    samples = self._sample_json(
+      prompt_tokens=prompt_tokens, 
+      prompt_masks=prompt_masks,
+      json_structure_masks=json_structure_masks,
+      max_length=self.config.model.length,
+      num_steps=num_steps, 
+      eps=eps, 
+    )
+    
+    if self.ema:
+      self.ema.restore(itertools.chain(
+        self.backbone.parameters(),
+        self.noise.parameters()))
+    
+    return samples

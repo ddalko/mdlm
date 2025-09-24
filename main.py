@@ -24,15 +24,23 @@ omegaconf.OmegaConf.register_new_resolver(
   'div_up', lambda x, y: (x + y - 1) // y)
 
 
-def _load_from_checkpoint(config, tokenizer):
-  if 'hf' in config.backbone:
-    return diffusion.Diffusion(
-      config, tokenizer=tokenizer).to('cuda')
+def load_model(config):
+  tokenizer = dataloader.get_tokenizer(config)
   
-  return diffusion.Diffusion.load_from_checkpoint(
-    config.eval.checkpoint_path,
-    tokenizer=tokenizer,
-    config=config)
+  # Lightning 체크포인트에서 로드하는 경우 (.ckpt 파일)
+  if hasattr(config.eval, 'checkpoint_path') and config.eval.checkpoint_path.endswith('.ckpt'):
+    return diffusion.Diffusion.load_from_checkpoint(
+      config.eval.checkpoint_path,
+      tokenizer=tokenizer,
+      config=config)
+  
+  # HuggingFace 모델 직접 로드하는 경우
+  elif config.backbone == 'hf_dit':
+    return diffusion.Diffusion(config, tokenizer=tokenizer).to('cuda')
+  
+  # 기본 동작 (새로 모델 생성)
+  else:
+    return diffusion.Diffusion(config, tokenizer=tokenizer).to('cuda')
 
 
 @L.pytorch.utilities.rank_zero_only
@@ -87,8 +95,7 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=512):
 
 def generate_samples(config, logger, tokenizer):
   logger.info('Generating samples.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
+  model = load_model(config)
   model.gen_ppl_metric.reset()
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
@@ -121,8 +128,7 @@ def generate_samples(config, logger, tokenizer):
 def _ppl_eval(config, logger, tokenizer):
   logger.info('Starting Zero Shot Eval.')
 
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
+  model = load_model(config)
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
@@ -149,8 +155,7 @@ def _ppl_eval(config, logger, tokenizer):
 
 def _json_eval(config, logger, tokenizer):
   logger.info('Eval JSON samples.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
+  model = load_model(config)
   train_ds, valid_ds = dataloader.get_dataloaders(
     config, tokenizer) 
   _print_batch(train_ds, valid_ds, tokenizer)
@@ -163,40 +168,75 @@ def _json_eval(config, logger, tokenizer):
     model.backbone.eval()
     model.noise.eval()
 
-    prompt_tokens = batch['input_ids'].to(f'cuda:{config.cuda_device}')
-    prompt_masks = batch['prompt_mask'].to(f'cuda:{config.cuda_device}')
+    prompt_tokens = batch['input_ids'].to('cuda')
+    prompt_masks = batch['prompt_mask'].to(device='cuda', dtype=torch.bool)
+
+    # 마지막 True 하나만 False 로 변경 (배치 처리 지원)
+    if prompt_masks.dim() == 2:
+      # 마지막 True 위치만 True 인 마스크 생성
+      # cumsum == total_sum 이 되는 최초 지점이 마지막 True
+      last_true_mask = prompt_masks & (prompt_masks.cumsum(-1) == prompt_masks.sum(-1, keepdim=True))
+      prompt_masks[last_true_mask] = False
+    else:
+      # 1D 인 경우
+      true_indices = torch.nonzero(prompt_masks, as_tuple=False).squeeze(-1)
+      if true_indices.numel() > 0:
+        prompt_masks[true_indices[-1]] = False
 
     if getattr(config, 'json_structure_token_prompting', False):
       logger.info('Using JSON structure token prompting.')
-      json_structure_masks = batch['json_structure_mask'].to(device=f'cuda:{config.cuda_device}', dtype=torch.bool)
+      json_structure_masks = batch['json_structure_mask'].to(device=prompt_masks.device, dtype=torch.bool)
     else:
       json_structure_masks = torch.zeros_like(prompt_masks, device=prompt_masks.device, dtype=torch.bool)
 
-    samples = model._sample_json(
+    samples = model.restore_model_and_sample_with_prompt(
       prompt_tokens=prompt_tokens,
-      prompt_mask=prompt_masks,
-      json_structure_mask=json_structure_masks,
+      prompt_masks=prompt_masks,
+      json_structure_masks=json_structure_masks,
       num_steps=config.sampling.steps,
       eps=config.training.sampling_eps,
     )
 
-    text_samples = model.tokenizer.batch_decode(samples, skip_special_tokens=True)
+    # Remove token ID 102 before decoding
+    filtered_samples = []
+    for sample in samples:
+      # Filter out token ID 102 from each sequence
+      filtered_sample = sample[sample != 102]
+      filtered_samples.append(filtered_sample)
+    
+    # Convert to list for individual decoding (avoids padding issues)
+    text_samples = []
+    for filtered_sample in filtered_samples:
+      decoded_text = model.tokenizer.decode(filtered_sample, skip_special_tokens=True)
+      text_samples.append(decoded_text)
+    
+    # Optional: Additional string-level cleanup if needed
+    # If token 102 has a specific string representation, uncomment below:
+    # token_102_str = tokenizer.decode([102])
+    # text_samples = [text.replace(token_102_str, '') for text in text_samples]
     for idx, seq in enumerate(text_samples):
       tmp = {"id": total_samples, "error_msg": ""}
       total_samples += 1
       correct = False
+      pred_json = None
       try:
         prompt = batch['prompt'][idx]
         json_schema = codeblockjsonparser.loads(prompt) if not config.ignore_validate_schema else {}
-        pred = extract_pred(seq)
-        if validate(pred, verify_schema=json_schema):
+        pred_json = extract_pred(seq)
+        if validate(pred_json, verify_schema=json_schema):
           print(f"{idx}: ✅ JSON valid & correct!")
           score += 1
           correct = True
       except Exception as e:
         print(f"{idx}: ❌ JSON invalid or incorrect. Error: {e}")
-        pred = seq
+        if pred_json is not None:
+          pred = pred_json
         tmp["error_msg"] = str(e)
+        response = torch.masked_select(batch['input_ids'][idx].to(prompt_masks.device), ~prompt_masks[idx])
+        response = response[response != 102]
+        response = response[response != 50256]
+        response = response[response != 50257]
+        tmp["gt"] = tokenizer.decode(response)
       
       tmp.update({
         "pred": pred,
@@ -262,6 +302,8 @@ def main(config):
     generate_samples(config, logger, tokenizer)
   elif config.mode == 'ppl_eval':
     _ppl_eval(config, logger, tokenizer)
+  elif config.mode == 'json_eval':
+    _json_eval(config, logger, tokenizer)
   else:
     _train(config, logger, tokenizer)
 
