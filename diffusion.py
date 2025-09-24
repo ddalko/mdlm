@@ -4,6 +4,7 @@ import os
 import typing
 from dataclasses import dataclass
 
+
 import hydra.utils
 import lightning as L
 import numpy as np
@@ -17,6 +18,9 @@ import dataloader
 import models
 import noise_schedule
 import utils
+from tqdm import tqdm
+
+from dataloader import JSON_STRUCTURE_TOKEN_IDS
 
 LOG2 = math.log(2)
 
@@ -73,6 +77,11 @@ class Diffusion(L.LightningModule):
     super().__init__()
     self.save_hyperparameters()
     self.config = config
+    # Chat template training settings
+    self.chat_template_training = getattr(self.config, 'chat_template_training', False)
+    print(f"chat_template_training: {self.chat_template_training}")
+    self.json_structure_token_masking = getattr(self.config, 'json_structure_token_masking', False)
+    print(f"json_structure_token_masking: {self.json_structure_token_masking}")
 
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
@@ -89,9 +98,13 @@ class Diffusion(L.LightningModule):
     else:
       self.mask_index = self.tokenizer.mask_token_id
     self.parameterization = self.config.parameterization
+    
+    # Get blocked token IDs from config if available, otherwise use default
+    self.blocked_token_ids = JSON_STRUCTURE_TOKEN_IDS if getattr(self.config, 'block_json_structure_token', False) else None
+    
     if self.config.backbone == 'dit':
       self.backbone = models.dit.DIT(
-        self.config, vocab_size=self.vocab_size)
+        self.config, vocab_size=self.vocab_size, mask_index=self.mask_index)
     elif self.config.backbone == 'dimamba':
       self.backbone = models.dimamba.DiMamba(
         self.config,
@@ -572,7 +585,7 @@ class Diffusion(L.LightningModule):
         self.gen_ppl_metric.update(
           nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
-  def q_xt(self, x, move_chance):
+  def q_xt(self, x, move_chance, prompt_mask=None, json_structure_mask=None):
     """Computes the noisy sample xt.
 
     Args:
@@ -582,6 +595,10 @@ class Diffusion(L.LightningModule):
     """
     move_indices = torch.rand(
       * x.shape, device=x.device) < move_chance
+    if prompt_mask is not None:
+      move_indices |= ~prompt_mask.bool()
+    if json_structure_mask is not None:
+      move_indices |= ~json_structure_mask.bool()
     xt = torch.where(move_indices, self.mask_index, x)
     return xt
 
@@ -844,7 +861,7 @@ class Diffusion(L.LightningModule):
                           dim=-1,
                           index=x0[:, :, None]).squeeze(-1)
 
-  def _forward_pass_diffusion(self, x0):
+  def _forward_pass_diffusion(self, x0, prompt_mask=None, json_structure_mask=None):
     t = self._sample_t(x0.shape[0], x0.device)
     if self.T > 0:
       t = (t * self.T).to(torch.int)
@@ -863,7 +880,16 @@ class Diffusion(L.LightningModule):
       unet_conditioning = sigma[:, None]
       move_chance = 1 - torch.exp(-sigma[:, None])
 
-    xt = self.q_xt(x0, move_chance)
+    # Pass prompt_mask to q_xt_varlen only if chat template training is enabled
+    fix_json = self.json_structure_token_masking and json_structure_mask is not None
+    fix_prompt = self.chat_template_training and prompt_mask is not None
+    if fix_json and fix_prompt:
+      xt = self.q_xt(x0, move_chance, prompt_mask, json_structure_mask)
+    elif fix_prompt:
+      xt = self.q_xt(x0, move_chance, prompt_mask)
+    else:
+      xt = self.q_xt(x0, move_chance)
+
     model_output = self.forward(xt, unet_conditioning)
     utils.print_nans(model_output, 'model_output')
 
@@ -893,7 +919,9 @@ class Diffusion(L.LightningModule):
     return - log_p_theta * (
       dsigma / torch.expm1(sigma))[:, None]
 
-  def _loss(self, x0, attention_mask):
+  def _loss(self, x0, attention_mask, prompt_mask=None, json_structure_mask=None):
+    fix_json = self.json_structure_token_masking and json_structure_mask is not None
+    fix_prompt = self.chat_template_training and prompt_mask is not None
     (input_tokens, output_tokens,
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
@@ -903,8 +931,24 @@ class Diffusion(L.LightningModule):
       loss = - logprobs.gather(
         -1, output_tokens[:, :, None])[:, :, 0]
     else:
-      loss = self._forward_pass_diffusion(input_tokens)
+      # Pass prompt_mask to forward pass only if chat template training is enabled
+      if fix_json and fix_prompt:
+        loss = self._forward_pass_diffusion(input_tokens, prompt_mask, json_structure_mask)
+      elif fix_prompt:
+        loss = self._forward_pass_diffusion(input_tokens, prompt_mask)
+      else:
+        loss = self._forward_pass_diffusion(input_tokens)
     
+    # Apply prompt masking to loss calculation for chat template training
+    if fix_json and fix_prompt:
+      # For json structure template: do not compute loss on json structure tokens
+      response_mask = ~(prompt_mask | json_structure_mask).bool()
+      attention_mask = attention_mask * response_mask
+    elif fix_prompt:
+      # For chat template: only compute loss on response tokens (non-prompt tokens)
+      response_mask = ~prompt_mask.bool()
+      attention_mask = attention_mask * response_mask
+
     nlls = loss * attention_mask
     count = attention_mask.sum()
 

@@ -1,7 +1,7 @@
 defaults:
   - _self_
-  - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
-  - /data: openwebtext
+  - /callbacks: [checkpoint_every_epoch, checkpoint_monitor, learning_rate_monitor]
+  - /data: schemabench
   - /model: small
   - /strategy: ddp
   - /noise: loglinear
@@ -14,6 +14,11 @@ parameterization: subs  # subs / d3pm / sedd
 time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
+variable_length: True
+start_with_bos_token: True
+ends_with_eos_token: True
+modeling_unmask: True
+modeling_unmask_layer: concat  # add / concat
 
 # Json generation configurations
 chat_template_training: True  # Enable chat template training mode
@@ -23,7 +28,7 @@ block_json_structure_token: True  # Logit masking for JSON structure tokens duri
 seed: 2
 
 loader:
-  global_batch_size: 512
+  original_global_batch_size: 32
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
@@ -59,8 +64,10 @@ eval:
   generate_samples: True
 
 optim:
-  weight_decay: 0
-  lr: 3e-4
+  # weight_decay: 0
+  # lr: 3e-4
+  weight_decay: 0.01
+  lr: 1e-4
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -81,8 +88,8 @@ trainer:
   val_check_interval: 10000
 
 wandb:
-  project: text-diffusion
-  notes: Mulan for text
+  project: mdlm-schemabench
+  notes: mdlm json generation training
   group: null
   job_type: null
   name: null

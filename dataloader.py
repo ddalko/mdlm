@@ -18,6 +18,9 @@ import transformers
 
 import utils
 
+# for GPT2 tokenizer
+JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
+
 LOGGER = utils.get_logger(__name__)
 
 
@@ -157,6 +160,96 @@ class Text8Tokenizer(transformers.PreTrainedTokenizer):
   def get_vocab(self) -> typing.Dict[str, int]:
     return self._vocab_str_to_int
 
+def generate_masks_token_based(example, tokenizer, block_size):
+  """
+  Generate both prompt and JSON structure masks using token-based approach.
+  
+  Args:
+    example: Dataset example containing 'text' and 'prompt' fields
+    tokenizer: Tokenizer to use for processing
+    block_size: Maximum sequence length
+    
+  Returns:
+    tuple: (prompt_masks, json_structure_masks)
+  """
+  # Handle batched processing
+  texts = example['text'] if isinstance(example['text'], list) else [example['text']]
+  prompts = example['prompt'] if isinstance(example['prompt'], list) else [example['prompt']]
+  
+  if len(texts) != len(prompts):
+    # If single prompt for multiple texts, repeat it
+    if len(prompts) == 1:
+      prompts = prompts * len(texts)
+    else:
+      raise ValueError(f"Mismatch between texts ({len(texts)}) and prompts ({len(prompts)})")
+  
+  prompt_masks = []
+  json_structure_masks = []
+  
+  for text, prompt in zip(texts, prompts):
+    # Tokenize full text and prompt
+    text_tokens = tokenizer(text, 
+                           max_length=block_size,
+                           padding='max_length', 
+                           truncation=True,
+                           add_special_tokens=True)['input_ids']
+    
+    prompt_tokens = tokenizer(prompt,
+                             add_special_tokens=True)['input_ids']
+    
+    # Find where prompt ends in text_tokens
+    prompt_mask = [False] * len(text_tokens)
+    json_structure_mask = [False] * len(text_tokens)
+    
+    # Simple approach: mark the first len(prompt_tokens) as prompt
+    # This assumes prompt is at the beginning
+    prompt_len = min(len(prompt_tokens), len(text_tokens))
+    for i in range(prompt_len):
+      prompt_mask[i] = True
+    
+    # Get response tokens (everything after prompt)
+    response_start_idx = prompt_len
+    response_tokens = text_tokens[response_start_idx:]
+    
+    # Filter out padding tokens from response
+    response_tokens = [t for t in response_tokens if t != tokenizer.pad_token_id]
+    
+    # Get JSON structure mask for response tokens
+    if response_tokens:
+      response_structure_mask = get_json_structure_mask(response_tokens)
+      
+      # Map back to full text_tokens
+      for i, is_structure in enumerate(response_structure_mask):
+        full_idx = response_start_idx + i
+        if full_idx < len(json_structure_mask):
+          json_structure_mask[full_idx] = is_structure
+    
+    prompt_masks.append(prompt_mask)
+    json_structure_masks.append(json_structure_mask)
+  
+  return prompt_masks, json_structure_masks
+
+
+def process_schemabench_masks(example, tokens, tokenizer, block_size):
+  """
+  Process and add masks for schemabench dataset using token-based approach.
+  
+  Args:
+    example: Dataset example containing 'text' and 'prompt' fields
+    tokens: Existing tokens dictionary to modify
+    tokenizer: Tokenizer to use for processing
+    block_size: Maximum sequence length
+  """
+  try:
+    prompt_masks, json_structure_masks = generate_masks_token_based(example, tokenizer, block_size)
+    tokens['prompt_mask'] = prompt_masks
+    tokens['json_structure_mask'] = json_structure_masks
+  except Exception as e:
+    LOGGER.warning(f"Failed to generate masks for schemabench: {e}")
+    # Fallback: create empty masks
+    batch_size = len(example['text']) if isinstance(example['text'], list) else 1
+    tokens['prompt_mask'] = [[False] * block_size for _ in range(batch_size)]
+    tokens['json_structure_mask'] = [[False] * block_size for _ in range(batch_size)]
 
 def get_lambada_test_dataset():
     url = "https://openaipublic.blob.core.windows.net/gpt-2/data/lambada_test.jsonl"
@@ -302,7 +395,7 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, data_files=None):
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
@@ -370,6 +463,10 @@ def get_dataset(
       'ag_news',
       cache_dir=cache_dir,
       streaming=streaming)
+  elif dataset_name == 'schemabench':
+    dataset = datasets.load_dataset(
+      'json',
+      data_files=data_files)
   else:
     dataset = datasets.load_dataset(
       dataset_name,
@@ -435,6 +532,10 @@ def get_dataset(
                          add_special_tokens=True,
                          return_attention_mask=True,
                          return_token_type_ids=True)
+
+    if dataset_name == 'schemabench':
+      process_schemabench_masks(example, tokens, tokenizer, block_size)
+
     return tokens
 
   if streaming:
@@ -483,6 +584,34 @@ def get_dataset(
     chunked_dataset.save_to_disk(_path)
   chunked_dataset = chunked_dataset.with_format('torch')
   return chunked_dataset
+
+
+def _split_schemabench_dataset(train_set, config, valid_seed=None):
+  """
+  Split schemabench dataset into train and validation sets using configured ratio.
+  
+  Args:
+    train_set: The full training dataset to split
+    config: Configuration object containing train_valid_ratio
+    valid_seed: Seed for reproducible splitting
+    
+  Returns:
+    tuple: (train_subset, valid_subset)
+  """
+  split_ratio = float(getattr(config.data, "train_valid_ratio", 0.9))  # Default 0.9 -> train, 0.1 -> valid
+  split_seed = valid_seed if valid_seed is not None else int(getattr(config, "seed", 42))
+  
+  # Calculate split sizes
+  total_size = len(train_set)
+  valid_portion = max(1, int(round(total_size * (1.0 - split_ratio))))
+  train_portion = total_size - valid_portion
+  
+  # Create reproducible split
+  generator = torch.Generator().manual_seed(split_seed)
+  train_subset, valid_subset = torch.utils.data.random_split(
+    train_set, [train_portion, valid_portion], generator=generator)
+  
+  return train_subset, valid_subset
 
 
 def get_tokenizer(config):
@@ -540,6 +669,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     raise ValueError(
       f'Eval Batch Size for {config.eval.batch_size} '
       f'not divisible by {num_gpus}.')
+
+  data_files = getattr(config.data, 'data_files', None)
   if skip_train:
     train_set = None
   else:
@@ -549,23 +680,32 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length)
+      block_size=config.model.length,
+      data_files=data_files)
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
   else:
     validation_split = 'validation'
-  if skip_valid:
-    valid_set = None
+
+  if config.data.train == 'schemabench':
+    # Special case: schemabench splits the training set internally
+    if skip_train:
+      raise ValueError("Cannot skip training set for schemabench as it's needed for validation split")
+    train_set, valid_set = _split_schemabench_dataset(train_set, config, valid_seed)
   else:
-    valid_set = get_dataset(
-      config.data.valid,
-      tokenizer,
-      wrap=config.data.wrap,
-      mode=validation_split,
-      cache_dir=config.data.cache_dir,
-      block_size=config.model.length,
-      streaming=False)
+    if skip_valid:
+      valid_set = None
+    else:
+      valid_set = get_dataset(
+        config.data.valid,
+        tokenizer,
+        wrap=config.data.wrap,
+        mode=validation_split,
+        cache_dir=config.data.cache_dir,
+        block_size=config.model.length,
+        streaming=False,
+        data_files=data_files)
 
   if skip_train:
     train_loader = None
