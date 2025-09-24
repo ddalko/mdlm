@@ -1,0 +1,10 @@
+checkpoint_every_epoch:
+  _target_: lightning.pytorch.callbacks.ModelCheckpoint
+  save_top_k: -1 # Do not save any "best" models; this callback is being used to save every epoch
+  save_last: False # we handle saving ourselves with every_n_epochs
+  dirpath: ${checkpointing.save_dir}/checkpoints/epochs
+  filename: epoch_{epoch:03d}
+  verbose: True
+  auto_insert_metric_name: False
+  every_n_epochs: 5 # save at the end of every epoch
+  save_on_train_epoch_end: True

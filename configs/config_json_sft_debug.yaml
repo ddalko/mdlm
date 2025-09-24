@@ -1,0 +1,40 @@
+defaults:
+  - config_json_sft
+
+# Override loader settings for debugging
+loader:
+  global_batch_size: 4  # Smaller batch size for debugging
+  eval_global_batch_size: ${.global_batch_size}
+  batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
+  num_workers: 0  # Disable multiprocessing for debugging
+  pin_memory: False  # Disable pin memory for debugging
+
+trainer:
+  _target_: lightning.Trainer
+  accelerator: cuda
+  num_nodes: 1
+  devices: 1  # Use single GPU for debugging
+  accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
+  gradient_clip_val: 1.0
+  precision: 'bf16-mixed'
+  num_sanity_val_steps: 1  # Reduce sanity checks
+  max_epochs: 2  # Shorter run for debugging
+  log_every_n_steps: 1
+  limit_train_batches: 0.01  # Use only 1% of training data for debugging
+  limit_val_batches: 0.01    # Use only 1% of validation data for debugging
+  check_val_every_n_epoch: 1
+  val_check_interval: null
+
+# Debugging specific settings
+wandb:
+  project: mdlm-schemabench-debug
+  notes: mdlm json generation debug run
+  mode: disabled  # Disable wandb for debugging
+
+# Enable endofjson token processing using unused token ID 102
+use_endofjson_token: True
+
+sampling:
+  num_sample_batches: 1  # Reduce sampling for debugging
+  num_sample_log: 1

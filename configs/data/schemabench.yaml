@@ -1,0 +1,7 @@
+train: schemabench
+valid: schemabench
+tokenizer_name_or_path: gpt2
+cache_dir: /workspace/data/schemabench
+data_files: /workspace/mdlm/chat_templated_jsonschema_max1024.json
+wrap: False
+streaming: False

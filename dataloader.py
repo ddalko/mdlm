@@ -20,6 +20,8 @@ import utils
 
 LOGGER = utils.get_logger(__name__)
 
+# for GPT2 tokenizer
+JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
 
 def get_json_structure_mask(tokens):
   """
@@ -32,14 +34,13 @@ def get_json_structure_mask(tokens):
   Returns:
       tuple: structure_mask
   """
-  # for GPT2 tokenizer
-  JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
   # Create structure mask - only mark tokens that are in JSON_STRUCTURE_TOKEN_IDS
   structure_mask = torch.zeros(len(tokens), dtype=torch.bool)
   structure_token_set = set(JSON_STRUCTURE_TOKEN_IDS)
   
   for i, token in enumerate(tokens):
-    token_id = token.item()
+    # token_id = token.item()
+    token_id = token
     if token_id in structure_token_set:
       # This is a structure token
       structure_mask[i] = True
@@ -417,12 +418,15 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, data_files=None):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, data_files=None, use_endofjson_token=False):
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
     filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
+  use_endofjson_token = use_endofjson_token
+  if use_endofjson_token:
+    LOGGER.info(f"Added <|endofjson|> token to tokenizer")
   
   if utils.fsspec_exists(_path):
     LOGGER.info(f'Loading data from: {_path}')
@@ -556,7 +560,7 @@ def get_dataset(
                          return_token_type_ids=True)
 
     if dataset_name == 'schemabench':
-      process_schemabench_masks(example, tokens, tokenizer, block_size)
+      process_schemabench_with_endofjson(example, tokens, tokenizer, block_size)
 
     return tokens
 
@@ -703,7 +707,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      data_files=data_files)
+      data_files=data_files,
+      use_endofjson_token=getattr(config, 'use_endofjson_token', False))
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -722,12 +727,13 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       valid_set = get_dataset(
         config.data.valid,
         tokenizer,
-        wrap=config.data.wrap,
         mode=validation_split,
+        wrap=config.data.wrap,
         cache_dir=config.data.cache_dir,
         block_size=config.model.length,
         streaming=False,
-        data_files=data_files)
+        data_files=data_files,
+        use_endofjson_token=getattr(config, 'use_endofjson_token', False))
 
   if skip_train:
     train_loader = None
@@ -738,7 +744,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=not config.data.streaming,
-      persistent_workers=True)
+      persistent_workers=config.loader.num_workers > 0)
     train_loader.tokenizer = tokenizer
   if skip_valid:
     valid_loader = None
@@ -755,7 +761,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=shuffle_valid,
-      generator=generator)
+      generator=generator,
+      persistent_workers=config.loader.num_workers > 0)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
 
@@ -866,3 +873,223 @@ class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
       yield index
 
     self.counter = 0
+
+
+def process_json_with_endofjson_token(text, prompt, tokenizer, block_size, endofjson_token_id):
+    """
+    Process JSON text by adding multiple <|endofjson|> tokens between JSON structure tokens.
+    
+    Args:
+        text: Full text containing prompt and response
+        prompt: Prompt text
+        tokenizer: Tokenizer to use
+        block_size: Maximum sequence length (1024)
+        endofjson_token_id: Token ID for <|endofjson|>
+        
+    Returns:
+        dict: Processed tokens with input_ids, attention_mask, and labels
+    """
+    # Tokenize full text and prompt
+    text_tokens = tokenizer(text, 
+                           max_length=block_size,
+                           padding='max_length', 
+                           truncation=True,
+                           add_special_tokens=True)['input_ids']
+    
+    prompt_tokens = tokenizer(prompt,
+                             add_special_tokens=True)['input_ids']
+    
+    # Find prompt length
+    prompt_len = min(len(prompt_tokens), len(text_tokens))
+    
+    # Get response tokens (everything after prompt)
+    response_start_idx = prompt_len
+    response_tokens = text_tokens[response_start_idx:]
+    
+    # Filter out padding tokens from response
+    response_tokens = [t for t in response_tokens if t != tokenizer.pad_token_id]
+    
+    if not response_tokens:
+        # No response tokens, return original
+        return {
+            'input_ids': text_tokens,
+            'attention_mask': [1 if t != tokenizer.pad_token_id else 0 for t in text_tokens],
+            'labels': text_tokens.copy()
+        }
+    
+    # Get JSON structure mask for response tokens
+    json_structure_mask = get_json_structure_mask(response_tokens)
+    
+    # Find segments between JSON structure tokens
+    segments = []
+    current_segment_start = 0
+    
+    for i, is_structure in enumerate(json_structure_mask):
+        if is_structure:
+            # Found a structure token
+            if i > current_segment_start:
+                # There are value tokens before this structure token
+                segments.append({
+                    'start': current_segment_start,
+                    'end': i,
+                    'type': 'value'
+                })
+            
+            # Add the structure token as a segment
+            segments.append({
+                'start': i,
+                'end': i + 1,
+                'type': 'structure'
+            })
+            
+            current_segment_start = i + 1
+    
+    # Handle remaining tokens after last structure token
+    if current_segment_start < len(response_tokens):
+        segments.append({
+            'start': current_segment_start,
+            'end': len(response_tokens),
+            'type': 'value'
+        })
+    
+    # Calculate available space for tokens
+    available_space = block_size - prompt_len
+    
+    # Count value segments to distribute space
+    value_segments = [seg for seg in segments if seg['type'] == 'value']
+    num_value_segments = len(value_segments)
+    
+    if num_value_segments == 0:
+        # No value segments, return original
+        return {
+            'input_ids': text_tokens,
+            'attention_mask': [1 if t != tokenizer.pad_token_id else 0 for t in text_tokens],
+            'labels': text_tokens.copy()
+        }
+    
+    # Calculate tokens per value segment (including endofjson tokens)
+    tokens_per_segment = max(5, available_space // num_value_segments)  # 최소 3개 (원본 1개 + endofjson 2개)
+    
+    # Build new token sequence
+    new_tokens = text_tokens[:prompt_len].copy()  # Keep prompt as is
+    
+    for segment in segments:
+        if segment['type'] == 'structure':
+            # Add structure token as is
+            token_idx = segment['start']
+            if token_idx < len(response_tokens):
+                new_tokens.append(response_tokens[token_idx])
+        
+        elif segment['type'] == 'value':
+            # Add value tokens + multiple endofjson tokens
+            segment_tokens = response_tokens[segment['start']:segment['end']]
+            original_segment_length = len(segment_tokens)
+            
+            if original_segment_length == 0:
+                # Empty segment, just add endofjson tokens to fill the space
+                endofjson_count = min(tokens_per_segment, 5)  # 최대 5개
+                new_tokens.extend([endofjson_token_id] * endofjson_count)
+            else:
+                # Calculate how many endofjson tokens to add
+                remaining_space = tokens_per_segment - original_segment_length
+                endofjson_count = max(1, min(remaining_space, 5))  # 최소 1개, 최대 5개
+                
+                # Add original value tokens (might be truncated)
+                if original_segment_length > tokens_per_segment - endofjson_count:
+                    # Truncate original tokens to make space for endofjson
+                    truncated_length = max(1, tokens_per_segment - endofjson_count)
+                    new_tokens.extend(segment_tokens[:truncated_length])
+                else:
+                    new_tokens.extend(segment_tokens)
+                
+                # Add multiple endofjson tokens
+                new_tokens.extend([endofjson_token_id] * endofjson_count)
+    
+    # Pad or truncate to block_size
+    if len(new_tokens) > block_size:
+        new_tokens = new_tokens[:block_size]
+    else:
+        # Pad with pad tokens
+        new_tokens.extend([tokenizer.pad_token_id] * (block_size - len(new_tokens)))
+    
+    # Create attention mask
+    attention_mask = [1 if t != tokenizer.pad_token_id else 0 for t in new_tokens]
+    
+    # Create labels (same as input_ids for language modeling)
+    labels = new_tokens.copy()
+    
+    return {
+        'input_ids': new_tokens,
+        'attention_mask': attention_mask,
+        'labels': labels
+    }
+
+
+def process_schemabench_with_endofjson(example, tokens, tokenizer, block_size):
+    """
+    Process schemabench dataset with <|endofjson|> token insertion.
+    Uses existing unused token ID 102 instead of adding new token to avoid vocab size issues.
+    """
+    try:
+        # Use existing unused token instead of adding new token
+        # Token ID 102 ('�') is never used in the dataset according to analysis
+        endofjson_token_id = 102
+        LOGGER.info(f"Using existing unused token ID {endofjson_token_id} as <|endofjson|> replacement")
+        
+        # No vocab size changes needed since we're reusing existing token
+        
+        # Handle batched processing
+        texts = example['text'] if isinstance(example['text'], list) else [example['text']]
+        prompts = example['prompt'] if isinstance(example['prompt'], list) else [example['prompt']]
+        
+        if len(texts) != len(prompts):
+            if len(prompts) == 1:
+                prompts = prompts * len(texts)
+            else:
+                raise ValueError(f"Mismatch between texts ({len(texts)}) and prompts ({len(prompts)})")
+        
+        processed_input_ids = []
+        processed_attention_masks = []
+        prompt_masks = []
+        json_structure_masks = []
+        
+        for text, prompt in zip(texts, prompts):
+            # Process each example
+            processed = process_json_with_endofjson_token(
+                text, prompt, tokenizer, block_size, endofjson_token_id
+            )
+            
+            processed_input_ids.append(processed['input_ids'])
+            processed_attention_masks.append(processed['attention_mask'])
+            
+            # Generate masks for the processed tokens
+            prompt_tokens = tokenizer(prompt, add_special_tokens=True)['input_ids']
+            prompt_len = min(len(prompt_tokens), len(processed['input_ids']))
+            
+            # Create prompt mask
+            prompt_mask = [True] * prompt_len + [False] * (len(processed['input_ids']) - prompt_len)
+            prompt_masks.append(prompt_mask)
+            
+            # Create JSON structure mask for processed tokens
+            json_structure_mask = [False] * len(processed['input_ids'])
+            
+            # Mark structure tokens
+            for i, token_id in enumerate(processed['input_ids']):
+                if i >= prompt_len:  # Only check response part
+                    if token_id in set(JSON_STRUCTURE_TOKEN_IDS):
+                        json_structure_mask[i] = True
+            
+            json_structure_masks.append(json_structure_mask)
+        
+        # Update tokens dictionary
+        tokens['input_ids'] = processed_input_ids
+        tokens['attention_mask'] = processed_attention_masks
+        tokens['prompt_mask'] = prompt_masks
+        tokens['json_structure_mask'] = json_structure_masks
+        
+    except Exception as e:
+        LOGGER.error(f"Failed to process schemabench with endofjson: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback to original processing
+        # process_schemabench_masks(example, tokens, tokenizer, block_size)

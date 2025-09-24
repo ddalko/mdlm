@@ -4,7 +4,6 @@ import os
 import typing
 from dataclasses import dataclass
 
-
 import hydra.utils
 import lightning as L
 import numpy as np
@@ -13,14 +12,13 @@ import torch.nn.functional as F
 import torchmetrics
 import transformers
 from torch import Tensor
+from tqdm import tqdm
 
 import dataloader
 import models
 import noise_schedule
 import utils
-from tqdm import tqdm
-
-from dataloader import JSON_STRUCTURE_TOKEN_IDS
+from json_utils import JSON_STRUCTURE_TOKEN_IDS
 
 LOG2 = math.log(2)
 
@@ -261,7 +259,7 @@ class Diffusion(L.LightningModule):
           pin_memory=self.config.loader.pin_memory,
           sampler=dl_sampler,
           shuffle=False,
-          persistent_workers=True))
+          persistent_workers=self.config.loader.num_workers > 0))
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
   def optimizer_step(self, *args, **kwargs):

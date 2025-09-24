@@ -1,6 +1,6 @@
+import json
 import os
 
-import json
 import fsspec
 import hydra
 import lightning as L
@@ -12,10 +12,7 @@ import torch
 import dataloader
 import diffusion
 import utils
-
-from json_utils import validate
-from json_utils import extract_pred
-from json_utils import CodeBlockJsonParser
+from json_utils import CodeBlockJsonParser, extract_pred, validate
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -74,7 +71,7 @@ def _print_config(
 
 
 @L.pytorch.utilities.rank_zero_only
-def _print_batch(train_ds, valid_ds, tokenizer, k=64):
+def _print_batch(train_ds, valid_ds, tokenizer, k=512):
   for dl_type, dl in [
     ('train', train_ds), ('valid', valid_ds)]:
     print(f'Printing {dl_type} dataloader batch.')
