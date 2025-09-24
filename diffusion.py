@@ -606,6 +606,105 @@ class Diffusion(L.LightningModule):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64)
 
+  @torch.no_grad()
+  def _sample_json(self, prompt_tokens, json_structure_tokens=None, max_length=None, num_steps=None, eps=1e-5):
+    """Generate samples from the model with a fixed prompt and optional JSON structure tokens.
+    
+    Args:
+      prompt_tokens: torch.Tensor with shape (batch_size, prompt_length)
+        containing the prompt token IDs to be fixed during sampling
+      json_structure_tokens: torch.Tensor with shape (batch_size, max_length) or None
+        containing the JSON structure token IDs to be fixed during sampling.
+        Non-structure positions should contain self.mask_index
+      max_length: int, maximum sequence length (default: config.model.length)
+      num_steps: int, number of denoising steps (default: config.sampling.steps)  
+      eps: float, minimum time value for sampling
+      
+    Returns:
+      torch.Tensor with shape (batch_size, max_length) containing generated samples
+    """
+    if self.parameterization == 'ar':
+      raise NotImplementedError("Prompt-conditioned sampling not implemented for AR model")
+    
+    if max_length is None:
+      max_length = self.config.model.length
+    if num_steps is None:
+      num_steps = self.config.sampling.steps
+      
+    batch_size = prompt_tokens.shape[0]
+    prompt_length = prompt_tokens.shape[1]
+    
+    if prompt_length >= max_length:
+      raise ValueError(f"Prompt length ({prompt_length}) must be less than max_length ({max_length})")
+    
+    # Initialize sequence with prompt + masks
+    x = torch.full(
+      (batch_size, max_length),
+      self.mask_index,
+      dtype=torch.int64,
+      device=self.device
+    )
+    # Set the prompt tokens (they remain fixed throughout sampling)
+    x[:, :prompt_length] = prompt_tokens.to(self.device)
+    
+    # Create mask to identify prompt positions (these won't be updated)
+    prompt_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
+    prompt_mask[:, :prompt_length] = True
+    
+    # Handle JSON structure tokens if provided
+    json_structure_mask = None
+    if json_structure_tokens is not None:
+      json_structure_tokens = json_structure_tokens.to(self.device)
+      # Create mask for JSON structure positions (non-mask tokens)
+      json_structure_mask = (json_structure_tokens != self.mask_index)
+      # Set JSON structure tokens in the sequence
+      x[json_structure_mask] = json_structure_tokens[json_structure_mask]
+    
+    timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)
+    dt = (1 - eps) / num_steps
+    p_x0_cache = None
+
+    for i in range(num_steps):
+      t = timesteps[i] * torch.ones(x.shape[0], 1, device=self.device)
+      
+      if self.sampler == 'ddpm':
+        x_new = self._ddpm_update(x, t, dt)
+      elif self.sampler == 'ddpm_cache':
+        p_x0_cache, x_new = self._ddpm_caching_update(
+          x, t, dt, p_x0=p_x0_cache)
+        if (not torch.allclose(x_new, x) or self.time_conditioning):
+          # Disable caching
+          p_x0_cache = None
+      else:
+        x_new = self._analytic_update(x, t, dt)
+      
+      # Keep prompt tokens fixed by restoring them after each update
+      x_new[prompt_mask] = prompt_tokens.to(self.device).flatten()
+      
+      # Keep JSON structure tokens fixed if provided
+      if json_structure_tokens is not None:
+        x_new[json_structure_mask] = json_structure_tokens[json_structure_mask]
+      
+      x = x_new
+
+    # Final denoising step if noise removal is enabled
+    if self.config.sampling.noise_removal:
+      t = timesteps[-1] * torch.ones(x.shape[0], 1, device=self.device)
+      if self.sampler == 'analytic':
+        x = self._denoiser_update(x, t)
+      else:
+        unet_conditioning = self.noise(t)[0]
+        x = self.forward(x, unet_conditioning).argmax(dim=-1)
+      
+      # Ensure prompt tokens remain fixed after final denoising
+      x[prompt_mask] = prompt_tokens.to(self.device).flatten()
+      
+      # Ensure JSON structure tokens remain fixed after final denoising
+      if json_structure_tokens is not None:
+        x[json_structure_mask] = json_structure_tokens[json_structure_mask]
+    
+    return x
+
   def _ddpm_caching_update(self, x, t, dt, p_x0=None):
     assert self.config.noise.type == 'loglinear'
     sigma_t, _ = self.noise(t)

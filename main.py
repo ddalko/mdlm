@@ -1,5 +1,6 @@
 import os
 
+import json
 import fsspec
 import hydra
 import lightning as L
@@ -11,6 +12,10 @@ import torch
 import dataloader
 import diffusion
 import utils
+
+from json_utils import validate
+from json_utils import extract_pred
+from json_utils import CodeBlockJsonParser
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -143,6 +148,69 @@ def _ppl_eval(config, logger, tokenizer):
   _, valid_ds = dataloader.get_dataloaders(
     config, tokenizer, skip_train=True, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
+
+
+def _json_eval(config, logger, tokenizer):
+  logger.info('Eval JSON samples.')
+  model = _load_from_checkpoint(config=config,
+                                tokenizer=tokenizer)
+  train_ds, valid_ds = dataloader.get_dataloaders(
+    config, tokenizer) 
+  _print_batch(train_ds, valid_ds, tokenizer)
+  codeblockjsonparser = CodeBlockJsonParser()
+
+  score = 0
+  total_samples = 0
+  results = []
+  for batch_idx, batch in enumerate(valid_ds):
+    model.backbone.eval()
+    model.noise.eval()
+
+    prompt_tokens = batch['input_ids'].to(f'cuda:{config.cuda_device}')
+    prompt_masks = batch['prompt_mask'].to(f'cuda:{config.cuda_device}')
+
+    if getattr(config, 'json_structure_token_prompting', False):
+      logger.info('Using JSON structure token prompting.')
+      json_structure_masks = batch['json_structure_mask'].to(device=f'cuda:{config.cuda_device}', dtype=torch.bool)
+    else:
+      json_structure_masks = torch.zeros_like(prompt_masks, device=prompt_masks.device, dtype=torch.bool)
+
+    samples = model._sample_json(
+      prompt_tokens=prompt_tokens,
+      prompt_mask=prompt_masks,
+      json_structure_mask=json_structure_masks,
+      num_steps=config.sampling.steps,
+      eps=config.training.sampling_eps,
+    )
+
+    text_samples = model.tokenizer.batch_decode(samples, skip_special_tokens=True)
+    for idx, seq in enumerate(text_samples):
+      tmp = {"id": total_samples, "error_msg": ""}
+      total_samples += 1
+      correct = False
+      try:
+        prompt = batch['prompt'][idx]
+        json_schema = codeblockjsonparser.loads(prompt) if not config.ignore_validate_schema else {}
+        pred = extract_pred(seq)
+        if validate(pred, verify_schema=json_schema):
+          print(f"{idx}: ✅ JSON valid & correct!")
+          score += 1
+          correct = True
+      except Exception as e:
+        print(f"{idx}: ❌ JSON invalid or incorrect. Error: {e}")
+        pred = seq
+        tmp["error_msg"] = str(e)
+      
+      tmp.update({
+        "pred": pred,
+        "schema": json_schema,
+        "correct": correct,
+      })
+      results.append(tmp)
+
+    print(f'JSON Validity: {score / total_samples:%}')
+    with open("json_eval_results.json", "w") as f:
+      json.dump(results, f, indent=2)
 
 
 def _train(config, logger, tokenizer):

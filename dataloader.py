@@ -18,11 +18,33 @@ import transformers
 
 import utils
 
-# for GPT2 tokenizer
-JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
-
 LOGGER = utils.get_logger(__name__)
 
+
+def get_json_structure_mask(tokens):
+  """
+  Use predefined JSON_STRUCTURE_TOKEN_IDS from dataloader.py to identify structure tokens.
+  This is the most reliable approach using the ground truth token IDs.
+  
+  Args:
+      text: Full text containing prompt and response
+
+  Returns:
+      tuple: structure_mask
+  """
+  # for GPT2 tokenizer
+  JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
+  # Create structure mask - only mark tokens that are in JSON_STRUCTURE_TOKEN_IDS
+  structure_mask = torch.zeros(len(tokens), dtype=torch.bool)
+  structure_token_set = set(JSON_STRUCTURE_TOKEN_IDS)
+  
+  for i, token in enumerate(tokens):
+    token_id = token.item()
+    if token_id in structure_token_set:
+      # This is a structure token
+      structure_mask[i] = True
+
+  return structure_mask
 
 def wt_detokenizer(string):
   # contractions
