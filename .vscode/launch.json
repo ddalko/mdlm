@@ -10,7 +10,7 @@
             "args": [
                 "--config-name",
                 "config_json_sft",
-                "wandb.name=mdlm-json-sft-v3"
+                "wandb.name=mdlm-json-sft-v6"
             ],
             "env": {
                 "PYTHONUNBUFFERED": "1",
@@ -33,6 +33,27 @@
                 "--config-name",
                 "config_json_sft_debug",
                 "wandb.name=mdlm-json-sft-debug"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "HYDRA_FULL_ERROR": "1",
+                "CUDA_LAUNCH_BLOCKING": "1",
+                "TORCH_USE_CUDA_DSA": "1",
+                "PYTORCH_DISABLE_JIT": "1"
+            },
+            "subProcess": false,
+            "justMyCode": false
+        },
+        {
+            "name": "eval",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--config-name",
+                "config_json_sft_eval",
             ],
             "env": {
                 "PYTHONUNBUFFERED": "1",

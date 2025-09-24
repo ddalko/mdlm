@@ -717,14 +717,7 @@ class Diffusion(L.LightningModule):
     # Use prompt_masks to determine prompt length and positions
     if prompt_masks is not None:
       prompt_masks = prompt_masks.to(self.device)
-      # prompt_masks is a boolean tensor indicating prompt token positions
       prompt_length = prompt_masks.sum(dim=1).max().item()  # Get maximum prompt length in batch
-    else:
-      # Fallback to original method if prompt_masks not provided
-      prompt_length = (prompt_tokens != self.mask_index).sum()
-    
-    if prompt_length >= max_length:
-      raise ValueError(f"Prompt length ({prompt_length}) must be less than max_length ({max_length})")
     
     # Initialize sequence with prompt + masks
     x = torch.full(
@@ -736,42 +729,25 @@ class Diffusion(L.LightningModule):
     
     # Set the prompt tokens using prompt_masks if available
     if prompt_masks is not None:
-      # Ensure prompt_masks and prompt_tokens have compatible shapes
-      if prompt_masks.shape[1] <= prompt_tokens.shape[1]:
-        # Use prompt_masks to set only the relevant prompt tokens
-        prompt_positions = prompt_masks[:, :min(prompt_masks.shape[1], max_length)]
-        if prompt_positions.shape[1] <= max_length:
-          x[:, :prompt_positions.shape[1]][prompt_positions] = prompt_tokens[:, :prompt_positions.shape[1]][prompt_positions]
-    else:
-      # Fallback to original method
-      x[:, :prompt_length] = prompt_tokens.to(self.device)
+      # Use prompt_masks to set only the relevant prompt tokens
+      prompt_positions = prompt_masks[:, :min(prompt_masks.shape[1], max_length)]
+      if prompt_positions.shape[1] <= max_length:
+        x[:, :prompt_positions.shape[1]][prompt_positions] = prompt_tokens[:, :prompt_positions.shape[1]][prompt_positions]
     
     # Create mask to identify prompt positions (these won't be updated)
     if prompt_masks is not None:
       prompt_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
       if prompt_masks.shape[1] <= max_length:
         prompt_mask[:, :prompt_masks.shape[1]] = prompt_masks[:, :max_length]
-    else:
-      prompt_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=self.device)
-      prompt_mask[:, :prompt_length] = True
     
     # Handle JSON structure tokens if provided
     json_structure_mask = None
     if json_structure_masks is not None:
-      json_structure_masks = json_structure_masks.to(self.device)
-      # json_structure_masks는 JSON 구조 토큰 위치를 나타내는 boolean mask
-      json_structure_mask = json_structure_masks
-      
+      json_structure_mask = json_structure_masks.to(self.device)
       # prompt_tokens(GT)에서 JSON 구조 토큰 위치의 값들을 x에 덮어쓰기
-      # prompt_tokens의 길이가 max_length와 같다고 가정
-      if prompt_tokens.shape[1] >= max_length:
-        # prompt_tokens이 max_length 이상이면 잘라서 사용
-        gt_tokens = prompt_tokens[:, :max_length].to(self.device)
-      else:
-        # prompt_tokens이 max_length보다 짧으면 패딩
-        gt_tokens = torch.full((batch_size, max_length), self.mask_index, 
-                              dtype=torch.int64, device=self.device)
-        gt_tokens[:, :prompt_tokens.shape[1]] = prompt_tokens.to(self.device)
+      gt_tokens = torch.full((batch_size, max_length), self.mask_index, 
+                            dtype=torch.int64, device=self.device)
+      gt_tokens[:, :prompt_tokens.shape[1]] = prompt_tokens.to(self.device)
       
       # JSON 구조 마스크에 해당하는 위치의 토큰들을 GT에서 복사
       x[json_structure_mask] = gt_tokens[json_structure_mask]
@@ -1307,7 +1283,7 @@ class Diffusion(L.LightningModule):
     return sampling_steps, samples, sequence_lengths
 
   def restore_model_and_sample_with_prompt(self, prompt_tokens, prompt_masks, json_structure_masks, num_steps, eps=1e-5):
-    """Generate samples from the model with fixed prompt tokens."""
+    """Generate samples from the model."""
     # Lightning auto-casting is not working in this method for some reason
     if self.ema:
       self.ema.store(itertools.chain(
@@ -1316,7 +1292,8 @@ class Diffusion(L.LightningModule):
       self.ema.copy_to(itertools.chain(
         self.backbone.parameters(),
         self.noise.parameters()))
-    
+    self.backbone.eval()
+    self.noise.eval()
     samples = self._sample_json(
       prompt_tokens=prompt_tokens, 
       prompt_masks=prompt_masks,
@@ -1325,10 +1302,10 @@ class Diffusion(L.LightningModule):
       num_steps=num_steps, 
       eps=eps, 
     )
-    
     if self.ema:
       self.ema.restore(itertools.chain(
         self.backbone.parameters(),
         self.noise.parameters()))
-    
+    self.backbone.train()
+    self.noise.train()
     return samples

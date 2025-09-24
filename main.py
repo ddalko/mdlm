@@ -171,18 +171,6 @@ def _json_eval(config, logger, tokenizer):
     prompt_tokens = batch['input_ids'].to('cuda')
     prompt_masks = batch['prompt_mask'].to(device='cuda', dtype=torch.bool)
 
-    # 마지막 True 하나만 False 로 변경 (배치 처리 지원)
-    if prompt_masks.dim() == 2:
-      # 마지막 True 위치만 True 인 마스크 생성
-      # cumsum == total_sum 이 되는 최초 지점이 마지막 True
-      last_true_mask = prompt_masks & (prompt_masks.cumsum(-1) == prompt_masks.sum(-1, keepdim=True))
-      prompt_masks[last_true_mask] = False
-    else:
-      # 1D 인 경우
-      true_indices = torch.nonzero(prompt_masks, as_tuple=False).squeeze(-1)
-      if true_indices.numel() > 0:
-        prompt_masks[true_indices[-1]] = False
-
     if getattr(config, 'json_structure_token_prompting', False):
       logger.info('Using JSON structure token prompting.')
       json_structure_masks = batch['json_structure_mask'].to(device=prompt_masks.device, dtype=torch.bool)
@@ -197,18 +185,8 @@ def _json_eval(config, logger, tokenizer):
       eps=config.training.sampling_eps,
     )
 
-    # Remove token ID 102 before decoding
-    filtered_samples = []
-    for sample in samples:
-      # Filter out token ID 102 from each sequence
-      filtered_sample = sample[sample != 102]
-      filtered_samples.append(filtered_sample)
-    
-    # Convert to list for individual decoding (avoids padding issues)
-    text_samples = []
-    for filtered_sample in filtered_samples:
-      decoded_text = model.tokenizer.decode(filtered_sample, skip_special_tokens=True)
-      text_samples.append(decoded_text)
+    filtered_samples = [sample[sample != 102] for sample in samples]  # remove <|endofjson|> token (id 102)
+    text_samples = model.tokenizer.batch_decode(filtered_samples, skip_special_tokens=True)
     
     # Optional: Additional string-level cleanup if needed
     # If token 102 has a specific string representation, uncomment below:
