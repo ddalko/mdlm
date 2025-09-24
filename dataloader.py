@@ -21,7 +21,7 @@ import utils
 LOGGER = utils.get_logger(__name__)
 
 # for GPT2 tokenizer
-JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
+JSON_STRUCTURE_TOKEN_IDS = [1, 11, 25, 58, 60, 90, 92, 366, 553, 1298, 1600, 2404, 2430, 3712, 4357, 4895, 5512, 5974, 7131, 8351, 8762, 8973, 9063, 9832, 11097, 11709, 11907, 11919, 13018, 14692, 15931, 17241, 17414, 17912, 18477, 20598, 20662, 21737, 23846, 24022, 25719, 26358, 27007, 29164, 30109, 30866, 32509, 33116, 33250, 34171, 34713, 36786, 37811, 38362, 38430, 42535, 42785, 43661, 45299, 47182, 47682, 47715, 48999]
 
 def get_json_structure_mask(tokens):
   """
@@ -877,14 +877,14 @@ class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
 
 def process_json_with_endofjson_token(text, prompt, tokenizer, block_size, endofjson_token_id):
     """
-    Process JSON text by adding multiple <|endofjson|> tokens between JSON structure tokens.
+    Process JSON text by inserting token ID 102 between structure tokens.
     
     Args:
         text: Full text containing prompt and response
         prompt: Prompt text
         tokenizer: Tokenizer to use
         block_size: Maximum sequence length (1024)
-        endofjson_token_id: Token ID for <|endofjson|>
+        endofjson_token_id: Token ID for <|endofjson|> (102)
         
     Returns:
         dict: Processed tokens with input_ids, attention_mask, and labels
@@ -896,18 +896,13 @@ def process_json_with_endofjson_token(text, prompt, tokenizer, block_size, endof
                            truncation=True,
                            add_special_tokens=True)['input_ids']
     
-    prompt_tokens = tokenizer(prompt,
-                             add_special_tokens=True)['input_ids']
+    prompt_tokens = tokenizer(prompt, add_special_tokens=True)['input_ids']
+    prompt_len = min(len(prompt_tokens), len(text_tokens)) - 1
+    # prompt_mask = tokenizer.decode(torch.tensor(text_tokens) * (torch.arange(block_size) < prompt_len-1))
     
-    # Find prompt length
-    prompt_len = min(len(prompt_tokens), len(text_tokens))
-    
-    # Get response tokens (everything after prompt)
-    response_start_idx = prompt_len
-    response_tokens = text_tokens[response_start_idx:]
-    
-    # Filter out padding tokens from response
-    response_tokens = [t for t in response_tokens if t != tokenizer.pad_token_id]
+    # Get response tokens (everything after prompt, excluding padding)
+    response_start_idx = prompt_len - 1  # 왜 그렇지?? <eos> 추가돼서 그런건가...
+    response_tokens = [t for t in text_tokens[response_start_idx:] if t != tokenizer.pad_token_id]
     
     if not response_tokens:
         # No response tokens, return original
@@ -918,92 +913,93 @@ def process_json_with_endofjson_token(text, prompt, tokenizer, block_size, endof
         }
     
     # Get JSON structure mask for response tokens
-    json_structure_mask = get_json_structure_mask(response_tokens)
+    json_structure_mask = get_json_structure_mask(response_tokens)  # 처음 "\n"과 <|endoftext|> 도 포함.
+    structure_indices = [i for i, is_struct in enumerate(json_structure_mask) if is_struct]
     
-    # Find segments between JSON structure tokens
-    segments = []
-    current_segment_start = 0
-    
-    for i, is_structure in enumerate(json_structure_mask):
-        if is_structure:
-            # Found a structure token
-            if i > current_segment_start:
-                # There are value tokens before this structure token
-                segments.append({
-                    'start': current_segment_start,
-                    'end': i,
-                    'type': 'value'
-                })
-            
-            # Add the structure token as a segment
-            segments.append({
-                'start': i,
-                'end': i + 1,
-                'type': 'structure'
-            })
-            
-            current_segment_start = i + 1
-    
-    # Handle remaining tokens after last structure token
-    if current_segment_start < len(response_tokens):
-        segments.append({
-            'start': current_segment_start,
-            'end': len(response_tokens),
-            'type': 'value'
-        })
-    
-    # Calculate available space for tokens
-    available_space = block_size - prompt_len
-    
-    # Count value segments to distribute space
-    value_segments = [seg for seg in segments if seg['type'] == 'value']
-    num_value_segments = len(value_segments)
-    
-    if num_value_segments == 0:
-        # No value segments, return original
+    if len(structure_indices) < 2:
+        # Need at least 2 structure tokens to insert between them
         return {
             'input_ids': text_tokens,
             'attention_mask': [1 if t != tokenizer.pad_token_id else 0 for t in text_tokens],
             'labels': text_tokens.copy()
         }
     
-    # Calculate tokens per value segment (including endofjson tokens)
-    tokens_per_segment = max(5, available_space // num_value_segments)  # 최소 3개 (원본 1개 + endofjson 2개)
+    # Calculate available space and insertion count
+    # Available space = max_seq_length - current_total_length
+    current_total_length = prompt_len + len(response_tokens)
+    available_space = block_size - current_total_length
     
-    # Build new token sequence
-    new_tokens = text_tokens[:prompt_len].copy()  # Keep prompt as is
+    print(f"DEBUG: Prompt len: {prompt_len}")
+    print(f"DEBUG: Response len: {len(response_tokens)}")  
+    print(f"DEBUG: Current total: {current_total_length}")
+    print(f"DEBUG: Block size: {block_size}")
+    print(f"DEBUG: Available space: {available_space}")
+    print(f"DEBUG: Structure indices: {structure_indices}")
     
-    for segment in segments:
-        if segment['type'] == 'structure':
-            # Add structure token as is
-            token_idx = segment['start']
-            if token_idx < len(response_tokens):
-                new_tokens.append(response_tokens[token_idx])
+    # Number of gaps between structure tokens
+    num_gaps = len(structure_indices) - 1
+    
+    if available_space <= 0:
+        # No space available, return original
+        return {
+            'input_ids': text_tokens,
+            'attention_mask': [1 if t != tokenizer.pad_token_id else 0 for t in text_tokens],
+            'labels': text_tokens.copy()
+        }
+    
+    # Limit the number of tokens per gap to a reasonable amount  
+    max_tokens_per_gap = min(5, available_space // max(1, num_gaps))  # Max 5 tokens per gap
+    
+    if num_gaps == 0:
+        tokens_per_gap = min(max_tokens_per_gap, available_space)
+    else:
+        tokens_per_gap = min(max_tokens_per_gap, available_space // num_gaps)
+    
+    print(f"DEBUG: Num gaps: {num_gaps}")
+    print(f"DEBUG: Available space: {available_space}")
+    print(f"DEBUG: Max tokens per gap (limited): {max_tokens_per_gap}")
+    print(f"DEBUG: Tokens per gap (final): {tokens_per_gap}")
+
+    structure_indices = structure_indices[:-1]  # Exclude first and last structure tokens
+    if tokens_per_gap == 0:
+        # Insert tokens one by one in each gap until available_space is exhausted
+        tokens_to_insert = available_space
+        new_response_tokens = response_tokens[:]
+        offset = 0
         
-        elif segment['type'] == 'value':
-            # Add value tokens + multiple endofjson tokens
-            segment_tokens = response_tokens[segment['start']:segment['end']]
-            original_segment_length = len(segment_tokens)
+        # Keep inserting 1 token per gap cyclically until tokens_to_insert reaches 0
+        while tokens_to_insert > 0:
+            for i in range(1, len(structure_indices)):  # Start from second structure token
+                if tokens_to_insert <= 0:
+                    break
+                    
+                insertion_index = structure_indices[i] + offset
+                # Insert 1 token at this gap
+                new_response_tokens = (
+                    new_response_tokens[:insertion_index] + 
+                    [endofjson_token_id] + 
+                    new_response_tokens[insertion_index:]
+                )
+                offset += 1
+                tokens_to_insert -= 1
+    else:
+        # Insert calculated number of tokens before each structure token (except the first)
+        new_response_tokens = response_tokens[:]
+        offset = 0
+        
+        for i in range(1, len(structure_indices)):  # Start from second structure token
+            insertion_index = structure_indices[i] + offset
+            tokens_to_insert_batch = [endofjson_token_id] * tokens_per_gap
             
-            if original_segment_length == 0:
-                # Empty segment, just add endofjson tokens to fill the space
-                endofjson_count = min(tokens_per_segment, 5)  # 최대 5개
-                new_tokens.extend([endofjson_token_id] * endofjson_count)
-            else:
-                # Calculate how many endofjson tokens to add
-                remaining_space = tokens_per_segment - original_segment_length
-                endofjson_count = max(1, min(remaining_space, 5))  # 최소 1개, 최대 5개
-                
-                # Add original value tokens (might be truncated)
-                if original_segment_length > tokens_per_segment - endofjson_count:
-                    # Truncate original tokens to make space for endofjson
-                    truncated_length = max(1, tokens_per_segment - endofjson_count)
-                    new_tokens.extend(segment_tokens[:truncated_length])
-                else:
-                    new_tokens.extend(segment_tokens)
-                
-                # Add multiple endofjson tokens
-                new_tokens.extend([endofjson_token_id] * endofjson_count)
+            new_response_tokens = (
+                new_response_tokens[:insertion_index] + 
+                tokens_to_insert_batch + 
+                new_response_tokens[insertion_index:]
+            )
+            offset += tokens_per_gap
+    
+    # Build final token sequence
+    new_tokens = text_tokens[:prompt_len] + new_response_tokens
     
     # Pad or truncate to block_size
     if len(new_tokens) > block_size:
@@ -1064,7 +1060,7 @@ def process_schemabench_with_endofjson(example, tokens, tokenizer, block_size):
             
             # Generate masks for the processed tokens
             prompt_tokens = tokenizer(prompt, add_special_tokens=True)['input_ids']
-            prompt_len = min(len(prompt_tokens), len(processed['input_ids']))
+            prompt_len = min(len(prompt_tokens), len(processed['input_ids'])) - 1
             
             # Create prompt mask
             prompt_mask = [True] * prompt_len + [False] * (len(processed['input_ids']) - prompt_len)
