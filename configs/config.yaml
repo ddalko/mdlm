@@ -19,7 +19,6 @@ subs_masking: False
 chat_template_training: True  # Enable chat template training mode
 json_structure_token_masking: True  # Mask JSON structure tokens (exclude from training loss)
 json_structure_token_prompting: True  # Use JSON structure tokens as part of the input prompt during evaluation
-block_json_structure_token: True  # Logit masking for JSON structure tokens during training
 seed: 2
 
 loader:

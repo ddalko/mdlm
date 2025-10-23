@@ -15,7 +15,7 @@ def analyze_token_usage():
     
     # 실제 데이터 로드
     try:
-        with open('/workspace/mdlm/chat_templated_jsonschema_max1024.json', 'r') as f:
+        with open('/workspace/mdlm/chat_templated_jsonschema_max1024_ws.json', 'r') as f:
             data = json.load(f)
         print(f"데이터 개수: {len(data)}")
     except Exception as e:

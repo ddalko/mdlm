@@ -158,17 +158,19 @@ class Text8Tokenizer(transformers.PreTrainedTokenizer):
   def get_vocab(self) -> typing.Dict[str, int]:
     return self._vocab_str_to_int
 
-def generate_masks_token_based(example, tokenizer, block_size):
+def generate_masks_token_based(example, tokenizer, block_size, endofvalue_token_id=None):
   """
   Generate both prompt and JSON structure masks using token-based approach.
+  Optionally inserts endofvalue tokens after each JSON value.
   
   Args:
     example: Dataset example containing 'text' and 'prompt' fields
     tokenizer: Tokenizer to use for processing
     block_size: Maximum sequence length
+    endofvalue_token_id: Token ID to insert after each JSON value (None to disable)
     
   Returns:
-    tuple: (prompt_masks, json_structure_masks)
+    tuple: (prompt_masks, json_structure_masks, modified_input_ids or None)
   """
   # Handle batched processing
   texts = example['text'] if isinstance(example['text'], list) else [example['text']]
@@ -183,6 +185,7 @@ def generate_masks_token_based(example, tokenizer, block_size):
   
   prompt_masks = []
   json_structure_masks = []
+  modified_input_ids_list = [] if endofvalue_token_id is not None else None
   
   for text, prompt in zip(texts, prompts):
     # Tokenize full text and prompt
@@ -216,11 +219,16 @@ def generate_masks_token_based(example, tokenizer, block_size):
     response_tokens = [t for t in response_tokens if t != tokenizer.pad_token_id]
     
     # Get JSON structure mask for response tokens
+    value_positions = []  # Track positions where values end (only if endofvalue enabled)
     if response_tokens:
       prompt_char_len = len(prompt)
       response = text[prompt_char_len:] # Get response text
       structure_char_mask = [False] * prompt_char_len + generate_structure_char_mask(response) # char-level mask
-      # json_structure_mask = charmask_to_tokenmask(structure_char_mask, text_token_offsets)
+      
+      # Identify value regions and their token positions
+      in_value = False
+      value_start_token = None
+      
       for i, (start, end) in enumerate(text_token_offsets):
         if i < prompt_len or (start, end) == (0, 0):  # (0,0)은 padding 또는 special token이므로 False 처리
           json_structure_mask[i] = False
@@ -240,16 +248,147 @@ def generate_masks_token_based(example, tokenizer, block_size):
         else:
           is_struct = (struct_count / nonspace_count) >= 0.5
 
-        # Token is structure if ANY character in it is structure
         json_structure_mask[i] = is_struct
+        
+        # Track value boundaries for endofvalue insertion (only if enabled)
+        if endofvalue_token_id is not None:
+          if not is_struct and not in_value:
+            # Start of a value region
+            in_value = True
+            value_start_token = i
+          elif is_struct and in_value:
+            # End of a value region
+            in_value = False
+            if value_start_token is not None:
+              # Determine value type by examining the actual tokens
+              value_token_ids = text_tokens[value_start_token:i]
+              
+              # Decode the value tokens to check type
+              value_decoded = tokenizer.decode(value_token_ids).strip()
+              
+              # Check if value is a primitive type (number, boolean, null)
+              is_primitive = False
+              
+              # Check for boolean
+              if value_decoded.lower() in ['true', 'false']:
+                is_primitive = True
+              # Check for null
+              elif value_decoded.lower() == 'null':
+                is_primitive = True
+              # Check for number (integer or float, including negative)
+              elif value_decoded.replace('-', '', 1).replace('.', '', 1).replace('e', '', 1).replace('E', '', 1).replace('+', '', 1).replace(' ', '').isdigit():
+                is_primitive = True
+              # More robust number check
+              else:
+                try:
+                  float(value_decoded)
+                  is_primitive = True
+                except (ValueError, AttributeError):
+                  pass
+              
+              if is_primitive:
+                # For primitive types (number/boolean/null), insert after the value
+                value_positions.append(i - 1)
+              else:
+                # For string/array/object, insert before the last token
+                # This puts EOV before the closing quote/bracket
+                if i - 2 >= value_start_token:
+                  value_positions.append(i - 2)
+                else:
+                  value_positions.append(i - 1)
+            value_start_token = None
+      
+      # If we end while still in a value region (only if endofvalue enabled)
+      if endofvalue_token_id is not None and in_value and value_start_token is not None:
+        # Find the last non-padding token
+        last_token_idx = None
+        for i in range(len(text_tokens) - 1, prompt_len - 1, -1):
+          if text_tokens[i] != tokenizer.pad_token_id:
+            last_token_idx = i
+            break
+        
+        if last_token_idx is not None:
+          # Decode value to check type
+          value_token_ids = text_tokens[value_start_token:last_token_idx+1]
+          value_decoded = tokenizer.decode(value_token_ids).strip()
+          
+          is_primitive = False
+          if value_decoded.lower() in ['true', 'false', 'null']:
+            is_primitive = True
+          else:
+            try:
+              float(value_decoded)
+              is_primitive = True
+            except (ValueError, AttributeError):
+              pass
+          
+          if is_primitive:
+            value_positions.append(last_token_idx)
+          else:
+            # Insert before last token for non-primitives
+            if last_token_idx > value_start_token:
+              value_positions.append(last_token_idx - 1)
+            else:
+              value_positions.append(last_token_idx)
     
-    prompt_masks.append(prompt_mask)
-    json_structure_masks.append(json_structure_mask)
+    # Insert endofvalue tokens if enabled
+    if endofvalue_token_id is not None and len(value_positions) > 0:
+      num_values = len(value_positions)
+      current_token_count = sum(1 for t in text_tokens if t != tokenizer.pad_token_id)
+      available_space = block_size - current_token_count
+      tokens_per_value = max(1, available_space // num_values)
+      
+      # Insert endofvalue tokens after each value position
+      new_tokens = []
+      new_prompt_mask = []
+      new_structure_mask = []
+      
+      last_pos = 0
+      for value_end_pos in value_positions:
+        # Add tokens up to and including the value end
+        new_tokens.extend(text_tokens[last_pos:value_end_pos + 1])
+        new_prompt_mask.extend(prompt_mask[last_pos:value_end_pos + 1])
+        new_structure_mask.extend(json_structure_mask[last_pos:value_end_pos + 1])
+        
+        # Add endofvalue tokens
+        for _ in range(tokens_per_value):
+          if len(new_tokens) < block_size:
+            new_tokens.append(endofvalue_token_id)
+            new_prompt_mask.append(False)  # Not part of prompt
+            new_structure_mask.append(True)  # Structure token
+        
+        last_pos = value_end_pos + 1
+      
+      # Add remaining tokens
+      new_tokens.extend(text_tokens[last_pos:])
+      new_prompt_mask.extend(prompt_mask[last_pos:])
+      new_structure_mask.extend(json_structure_mask[last_pos:])
+      
+      # Truncate or pad to block_size
+      if len(new_tokens) > block_size:
+        new_tokens = new_tokens[:block_size]
+        new_prompt_mask = new_prompt_mask[:block_size]
+        new_structure_mask = new_structure_mask[:block_size]
+      else:
+        padding_len = block_size - len(new_tokens)
+        new_tokens.extend([tokenizer.pad_token_id] * padding_len)
+        new_prompt_mask.extend([False] * padding_len)
+        new_structure_mask.extend([False] * padding_len)
+      
+      prompt_masks.append(torch.tensor(new_prompt_mask, dtype=torch.bool))
+      json_structure_masks.append(torch.tensor(new_structure_mask, dtype=torch.bool))
+      modified_input_ids_list.append(new_tokens)
+    else:
+      # No endofvalue insertion or no values found
+      prompt_masks.append(prompt_mask)
+      json_structure_masks.append(json_structure_mask)
+      if endofvalue_token_id is not None:
+        modified_input_ids_list.append(text_tokens)
   
-  return prompt_masks, json_structure_masks
+  return prompt_masks, json_structure_masks, modified_input_ids_list
 
 
-def process_schemabench_masks(example, tokens, tokenizer, block_size):
+def process_schemabench_masks(example, tokens, tokenizer, block_size, use_endofvalue_token=False):
   """
   Process and add masks for schemabench dataset using token-based approach.
   
@@ -258,13 +397,25 @@ def process_schemabench_masks(example, tokens, tokenizer, block_size):
     tokens: Existing tokens dictionary to modify
     tokenizer: Tokenizer to use for processing
     block_size: Maximum sequence length
+    use_endofvalue_token: Whether to insert endofvalue tokens (ID 102) after values
   """
   try:
-    prompt_masks, json_structure_masks = generate_masks_token_based(example, tokenizer, block_size)
+    if use_endofvalue_token:
+      prompt_masks, json_structure_masks, modified_input_ids = generate_masks_token_based(
+        example, tokenizer, block_size, endofvalue_token_id=102)
+      # Replace input_ids with modified version that includes endofvalue tokens
+      tokens['input_ids'] = modified_input_ids
+    else:
+      # Original behavior without endofvalue tokens
+      prompt_masks, json_structure_masks, _ = generate_masks_token_based(
+        example, tokenizer, block_size, endofvalue_token_id=None)
+    
     tokens['prompt_mask'] = prompt_masks
     tokens['json_structure_mask'] = json_structure_masks
   except Exception as e:
     LOGGER.warning(f"Failed to generate masks for schemabench: {e}")
+    import traceback
+    LOGGER.warning(f"Traceback: {traceback.format_exc()}")
     # Fallback: create empty masks
     batch_size = len(example['text']) if isinstance(example['text'], list) else 1
     tokens['prompt_mask'] = [[False] * block_size for _ in range(batch_size)]
@@ -414,15 +565,15 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, data_files=None, use_endofjson_token=False):
+    block_size=1024, num_proc=len(os.sched_getaffinity(0)), streaming=False, data_files=None, use_endofvalue_token=False):
   if wrap:
     filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
   else:
     filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
-  use_endofjson_token = use_endofjson_token
-  if use_endofjson_token:
-    LOGGER.info(f"Added <|endofjson|> token to tokenizer")
+  
+  if use_endofvalue_token:
+    LOGGER.info(f"Enabled endofvalue token (ID 102) insertion after JSON values")
   
   if utils.fsspec_exists(_path):
     LOGGER.info(f'Loading data from: {_path}')
@@ -556,7 +707,9 @@ def get_dataset(
                          return_token_type_ids=True)
 
     if dataset_name == 'schemabench':
-      process_schemabench_masks(example, tokens, tokenizer, block_size)
+      # Use endofvalue token insertion if use_endofvalue_token is enabled
+      process_schemabench_masks(example, tokens, tokenizer, block_size, 
+                                use_endofvalue_token=use_endofvalue_token)
 
     return tokens
 
@@ -704,7 +857,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
       data_files=data_files,
-      use_endofjson_token=getattr(config, 'use_endofjson_token', False))
+      use_endofvalue_token=getattr(config, 'use_endofvalue_token', False))
   
   if config.data.valid in ['text8', 'lm1b', 'ag_news']:
     validation_split = 'test'
@@ -729,7 +882,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
         block_size=config.model.length,
         streaming=False,
         data_files=data_files,
-        use_endofjson_token=getattr(config, 'use_endofjson_token', False))
+        use_endofvalue_token=getattr(config, 'use_endofvalue_token', False))
 
   if skip_train:
     train_loader = None

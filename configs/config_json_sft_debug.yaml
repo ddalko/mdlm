@@ -33,7 +33,7 @@ wandb:
   mode: disabled  # Disable wandb for debugging
 
 # Enable endofjson token processing using unused token ID 102
-use_endofjson_token: True
+use_endofvalue_token: True  # Insert endofvalue token (ID 102) after each JSON value
 
 sampling:
   num_sample_batches: 1  # Reduce sampling for debugging

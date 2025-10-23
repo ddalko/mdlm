@@ -19,8 +19,7 @@ subs_masking: False
 chat_template_training: True  # Enable chat template training mode
 json_structure_token_masking: True  # Mask JSON structure tokens (exclude from training loss)
 json_structure_token_prompting: True  # Use JSON structure tokens as part of the input prompt during evaluation
-block_json_structure_token: True  # Logit masking for JSON structure tokens during training
-use_endofjson_token: True
+use_endofvalue_token: True  # Insert endofvalue token (ID 102) after each JSON value
 ignore_validate_schema: True  # Ignore schema validation when computing json correctness during evaluation
 
 seed: 2
