@@ -13,6 +13,7 @@ import dataloader
 import diffusion
 import utils
 from json_utils import CodeBlockJsonParser, extract_pred, validate
+from json_error_analyzer import JSONErrorAnalyzer
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -185,7 +186,7 @@ def _json_eval(config, logger, tokenizer):
       eps=config.training.sampling_eps,
     )
 
-    filtered_samples = [sample[sample != 102] for sample in samples]  # remove <|endofjson|> token (id 102)
+    filtered_samples = [sample[sample != 102] for sample in samples]  # remove |endofvalue| token (id 102)
     text_samples = model.tokenizer.batch_decode(filtered_samples, skip_special_tokens=True)
     
     # Optional: Additional string-level cleanup if needed
@@ -205,6 +206,7 @@ def _json_eval(config, logger, tokenizer):
           print(f"{idx}: ✅ JSON valid & correct!")
           score += 1
           correct = True
+          pred = pred_json
       except Exception as e:
         print(f"{idx}: ❌ JSON invalid or incorrect. Error: {e}")
         if pred_json is not None:
@@ -223,9 +225,24 @@ def _json_eval(config, logger, tokenizer):
       })
       results.append(tmp)
 
-    print(f'JSON Validity: {score / total_samples:%}')
-    with open("json_eval_results.json", "w") as f:
-      json.dump(results, f, indent=2)
+  print(f'JSON Validity: {score / total_samples:%}')
+  json_file = "json_eval_results.json"
+  with open(json_file, "w") as f:
+    json.dump(results, f, indent=2)
+  
+  output_file = "/workspace/mdlm/json_error_analysis.html"
+  print("JSON 오류 분석 시작...")
+  analyzer = JSONErrorAnalyzer(json_file)
+  if analyzer.data:
+    report_file = analyzer.generate_report(output_file)
+    if report_file:
+      print(f"\n✅ 분석 완료!")
+      print(f"📄 리포트 파일: {report_file}")
+      print(f"🌐 브라우저에서 열어보세요!")
+    else:
+      print("❌ 리포트 생성에 실패했습니다.")
+  else:
+    print("❌ 데이터 로드에 실패했습니다.")
 
 
 def _train(config, logger, tokenizer):

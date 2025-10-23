@@ -337,6 +337,7 @@ def generate_masks_token_based(example, tokenizer, block_size, endofvalue_token_
       current_token_count = sum(1 for t in text_tokens if t != tokenizer.pad_token_id)
       available_space = block_size - current_token_count
       tokens_per_value = max(1, available_space // num_values)
+      remainder = available_space % num_values  # Calculate remainder
       
       # Insert endofvalue tokens after each value position
       new_tokens = []
@@ -344,18 +345,24 @@ def generate_masks_token_based(example, tokenizer, block_size, endofvalue_token_
       new_structure_mask = []
       
       last_pos = 0
-      for value_end_pos in value_positions:
+      for idx, value_end_pos in enumerate(value_positions):
         # Add tokens up to and including the value end
         new_tokens.extend(text_tokens[last_pos:value_end_pos + 1])
         new_prompt_mask.extend(prompt_mask[last_pos:value_end_pos + 1])
         new_structure_mask.extend(json_structure_mask[last_pos:value_end_pos + 1])
         
+        # Calculate number of endofvalue tokens to insert
+        num_eov_tokens = tokens_per_value
+        # Add remainder to the last value to avoid MASK tokens before EOS
+        if idx == len(value_positions) - 1:
+          num_eov_tokens += remainder
+        
         # Add endofvalue tokens
-        for _ in range(tokens_per_value):
+        for _ in range(num_eov_tokens):
           if len(new_tokens) < block_size:
             new_tokens.append(endofvalue_token_id)
             new_prompt_mask.append(False)  # Not part of prompt
-            new_structure_mask.append(True)  # Structure token
+            new_structure_mask.append(False)  # Value token (not structure)
         
         last_pos = value_end_pos + 1
       

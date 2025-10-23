@@ -74,7 +74,7 @@ def analyze_token_usage():
         recommended_token = min(unused_token_ids)  # 가장 작은 ID 선택
         try:
             token_str = tokenizer.decode([recommended_token])
-            print(f"\n권장 <|endofjson|> 대체 토큰:")
+            print(f"\n권장 |endofvalue| 대체 토큰:")
             print(f"  토큰 ID: {recommended_token}")
             print(f"  토큰 문자열: '{token_str}'")
             print(f"  사용 횟수: 0 (미사용)")
@@ -86,7 +86,7 @@ def analyze_token_usage():
             recommended_token, usage_count = least_used[0]
             try:
                 token_str = tokenizer.decode([recommended_token])
-                print(f"\n권장 <|endofjson|> 대체 토큰 (가장 적게 사용됨):")
+                print(f"\n권장 |endofvalue| 대체 토큰 (가장 적게 사용됨):")
                 print(f"  토큰 ID: {recommended_token}")
                 print(f"  토큰 문자열: '{token_str}'")
                 print(f"  사용 횟수: {usage_count}")
@@ -121,7 +121,7 @@ def check_special_tokens():
     # UNK 토큰이 있다면 그것을 사용할 수 있는지 확인
     if tokenizer.unk_token is not None:
         unk_id = tokenizer.unk_token_id
-        print(f"\nUNK 토큰을 <|endofjson|> 대신 사용 가능:")
+        print(f"\nUNK 토큰을 |endofvalue| 대신 사용 가능:")
         print(f"  토큰 ID: {unk_id}")
         print(f"  토큰 문자열: '{tokenizer.unk_token}'")
 

@@ -10,6 +10,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from json_utils import generate_structure_char_mask
+
 
 @dataclass
 class ErrorInfo:
@@ -103,12 +105,11 @@ class JSONErrorAnalyzer:
     
     def highlight_json_structure(self, text: str) -> str:
         """JSON 구조 문자를 노란색으로 하이라이트"""
-        # JSON 구조 문자들
-        structure_chars = {'{', '}', '[', ']', '"', ',', ':'}
+        structure_char_mask = generate_structure_char_mask(text)
         
         result = []
-        for char in text:
-            if char in structure_chars:
+        for idx, char in enumerate(text):
+            if structure_char_mask[idx]:
                 escaped_char = html.escape(char)
                 result.append(f'<span style="background-color: #fff3cd; color: #856404; font-weight: bold;">{escaped_char}</span>')
             else:
@@ -116,13 +117,10 @@ class JSONErrorAnalyzer:
         
         return ''.join(result)
     
-    def highlight_error_position(self, text: str, position: int, context_chars: int = 50) -> str:
+    def highlight_error_position(self, text: str, position: int) -> str:
         """에러 위치를 빨간색으로 하이라이트하고 구조 문자는 노란색으로 하이라이트"""
         if position is None or position >= len(text):
             return self.highlight_json_structure(text)
-        
-        # 먼저 구조 문자를 하이라이트
-        structure_chars = {'{', '}', '[', ']', '"', ',', ':'}
         
         result = []
         for i, char in enumerate(text):
@@ -130,10 +128,6 @@ class JSONErrorAnalyzer:
                 # 에러 위치는 빨간색으로 하이라이트 (구조 문자보다 우선)
                 escaped_char = html.escape(char)
                 result.append(f'<span style="background-color: #ff6b6b; color: white; font-weight: bold; padding: 2px;">{escaped_char}</span>')
-            elif char in structure_chars:
-                # 구조 문자는 노란색으로 하이라이트
-                escaped_char = html.escape(char)
-                result.append(f'<span style="background-color: #fff3cd; color: #856404; font-weight: bold;">{escaped_char}</span>')
             else:
                 result.append(html.escape(char))
         

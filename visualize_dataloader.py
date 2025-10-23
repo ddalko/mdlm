@@ -16,6 +16,33 @@ from transformers import AutoTokenizer
 sys.path.append(str(Path(__file__).parent.parent))
 from dataloader import get_dataset
 
+def _split_schemabench_dataset(train_set, valid_seed=None):
+  """
+  Split schemabench dataset into train and validation sets using configured ratio.
+  
+  Args:
+    train_set: The full training dataset to split
+    config: Configuration object containing train_valid_ratio
+    valid_seed: Seed for reproducible splitting
+    
+  Returns:
+    tuple: (train_subset, valid_subset)
+  """
+  split_ratio = 0.9  # Default 0.9 -> train, 0.1 -> valid
+  split_seed = valid_seed if valid_seed is not None else 2
+  
+  # Calculate split sizes
+  total_size = len(train_set)
+  valid_portion = max(1, int(round(total_size * (1.0 - split_ratio))))
+  train_portion = total_size - valid_portion
+  
+  # Create reproducible split
+  generator = torch.Generator().manual_seed(split_seed)
+  train_subset, valid_subset = torch.utils.data.random_split(
+    train_set, [train_portion, valid_portion], generator=generator)
+  
+  return train_subset, valid_subset
+
 
 def process_sample_data(
     tokens: List[int],
@@ -327,7 +354,7 @@ def main_streamlit():
     if 'samples' not in st.session_state:
         with st.spinner("Loading dataset and processing samples..."):
             tokenizer_name = "gpt2"
-            data_file = "chat_templated_jsonschema_max1024_ws.json"
+            data_file = "chat_templated_jsonschema_max1024_ws_1.json"
             block_size = 1024
             cache_dir = ".cache_viz_streamlit"
             use_endofvalue_token = True  # Enable endofvalue token insertion
@@ -359,7 +386,8 @@ def main_streamlit():
                 use_endofvalue_token=use_endofvalue_token
             )
             
-            st.session_state.samples = load_and_process_dataset(dataset, tokenizer, max_samples=50)
+            train_set, valid_set = _split_schemabench_dataset(dataset)
+            st.session_state.samples = load_and_process_dataset(valid_set, tokenizer, max_samples=50)
             
             # Clean up cache
             if os.path.exists(cache_dir):
