@@ -12,46 +12,13 @@ import torch.nn.functional as F
 import torchmetrics
 import transformers
 from torch import Tensor
-from tqdm import tqdm
 
 import dataloader
 import models
 import noise_schedule
 import utils
-from json_utils import JSON_STRUCTURE_TOKEN_IDS
 
 LOG2 = math.log(2)
-
-
-class DDitFinalLayer(torch.nn.Module):
-  def __init__(self, hidden_size, out_channels, cond_dim):
-    super().__init__()
-    self.norm_final = torch.nn.LayerNorm(hidden_size, bias=False)  # Match HuggingFace model structure
-    self.linear = torch.nn.Linear(hidden_size, out_channels)
-    self.linear.weight.data.zero_()
-    self.linear.bias.data.zero_()
-
-    self.adaLN_modulation = torch.nn.Linear(cond_dim,
-                                      2 * hidden_size,
-                                      bias=True)
-    self.adaLN_modulation.weight.data.zero_()
-    self.adaLN_modulation.bias.data.zero_()
-  
-    self.blocked_token_ids = JSON_STRUCTURE_TOKEN_IDS
-    blocked = torch.zeros(out_channels, dtype=torch.float32)
-    if self.blocked_token_ids:
-      blocked[torch.tensor(self.blocked_token_ids, dtype=torch.long)] = float("-inf")
-    self.register_buffer("blocked_mask", blocked)
-
-  def forward(self, x, c):
-    # Modulate with conditioning
-    shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
-    # Apply modulation (assuming modulate_fused function exists or implementing basic version)
-    x = self.norm_final(x) * (1 + scale) + shift
-    x = self.linear(x)
-    if self.blocked_token_ids is not None and hasattr(self, 'blocked_mask') and self.blocked_mask.any():
-      return x + self.blocked_mask.to(x.device)
-    return x
 
 
 def _sample_categorical(categorical_probs):
@@ -128,9 +95,6 @@ class Diffusion(L.LightningModule):
       self.mask_index = self.tokenizer.mask_token_id
     self.parameterization = self.config.parameterization
     
-    # Get blocked token IDs from config if available, otherwise use default
-    self.blocked_token_ids = JSON_STRUCTURE_TOKEN_IDS if getattr(self.config, 'block_json_structure_token', False) else None
-    
     if self.config.backbone == 'dit':
       self.backbone = models.dit.DIT(
         self.config, vocab_size=self.vocab_size, mask_index=self.mask_index)
@@ -148,24 +112,6 @@ class Diffusion(L.LightningModule):
       # 항상 기본 모델로 초기화 (Lightning load_from_checkpoint가 나중에 가중치를 덮어씀)
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         'kuleshov-group/mdlm-owt', trust_remote_code=True)
-      
-      # Replace final layer with custom DDitFinalLayer that blocks JSON structure tokens
-      if hasattr(self.backbone, 'backbone') and hasattr(self.backbone.backbone, 'output_layer'):
-        original_final = self.backbone.backbone.output_layer
-        hidden_size = original_final.linear.in_features
-        out_channels = original_final.linear.out_features
-        cond_dim = original_final.adaLN_modulation.in_features
-        
-        # Create new final layer with blocking
-        new_final_layer = DDitFinalLayer(hidden_size, out_channels, cond_dim)
-        
-        # Copy weights from original layer
-        new_final_layer.norm_final.load_state_dict(original_final.norm_final.state_dict())
-        new_final_layer.linear.load_state_dict(original_final.linear.state_dict())
-        new_final_layer.adaLN_modulation.load_state_dict(original_final.adaLN_modulation.state_dict())
-        
-        # Replace the output layer
-        self.backbone.backbone.output_layer = new_final_layer
     else:
       raise ValueError(
         f'Unknown backbone: {self.config.backbone}')
@@ -229,15 +175,6 @@ class Diffusion(L.LightningModule):
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
       self.ema.load_state_dict(checkpoint['ema'])
-
-    state_dict = checkpoint.get('state_dict', {})
-    if hasattr(self.backbone, 'output_layer'):
-      blocked_mask_key = 'backbone.output_layer.blocked_mask'
-      if blocked_mask_key not in state_dict:
-        print(f"Warning: {blocked_mask_key} not found in checkpoint. Using default empty mask.")
-        # Set strict=False for this checkpoint to avoid missing key errors
-        checkpoint['strict'] = False
-
     # Copied from:
     # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
     self.fast_forward_epochs = checkpoint['loops'][
@@ -245,19 +182,6 @@ class Diffusion(L.LightningModule):
     self.fast_forward_batches = checkpoint['loops'][
       'fit_loop']['epoch_loop.batch_progress'][
         'current']['completed']
-
-  def load_state_dict(self, state_dict, strict=True):
-    """
-    Override to handle backward compatibility with models that don't have blocked_mask.
-    """
-    # Check for missing blocked_mask
-    if hasattr(self.backbone, 'output_layer'):
-      blocked_mask_key = 'backbone.output_layer.blocked_mask'
-      if blocked_mask_key not in state_dict:
-        print(f"Warning: {blocked_mask_key} not found in state_dict. Loading with strict=False.")
-        strict = False
-    
-    return super().load_state_dict(state_dict, strict=strict)
 
   def on_save_checkpoint(self, checkpoint):
     if self.ema:

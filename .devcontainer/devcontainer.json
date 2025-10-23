@@ -1,7 +1,6 @@
 {
-  "name": "MDLM-original",
-  "dockerFile": "../Dockerfile",
-  "context": "..",
+  "name": "MDLM-json",
+  "image": "mdlm-env:latest",
   // Configure tool-specific properties
   "customizations": {
     "vscode": {
@@ -9,77 +8,28 @@
       "extensions": [
         "ms-python.python",
         "ms-python.vscode-pylance",
-        "ms-toolsai.jupyter",
         "ms-python.debugpy",
         "ms-vscode.cmake-tools",
         "ms-vscode.cpptools",
         "ms-azuretools.vscode-docker",
         "github.copilot",
         "github.copilot-chat",
-        "ms-python.isort",
-        "redhat.vscode-yaml",
         "ms-vscode.vscode-json",
-        "eamodio.gitlens",
-        "njpwerner.autodocstring",
-        "ms-vscode.hexdump",
         "ms-toolsai.vscode-ai"
       ],
       // VS Code settings
       "settings": {
-        "python.defaultInterpreterPath": "/opt/conda/envs/mdlm/bin/python",
-        "python.terminal.activateEnvironment": false,
-        "python.linting.enabled": true,
-        "python.linting.pylintEnabled": false,
-        "python.linting.flake8Enabled": true,
-        "python.linting.lintOnSave": true,
-        "editor.formatOnSave": true,
-        "editor.codeActionsOnSave": {
-          "source.organizeImports": "explicit"
-        },
-        "jupyter.defaultKernel": "Python 3 (mdlm)",
-        "files.exclude": {
-          "**/__pycache__": true,
-          "**/*.pyc": true,
-          "**/outputs": true
-        },
-        "terminal.integrated.defaultProfile.linux": "bash",
-        "terminal.integrated.profiles.linux": {
-          "bash": {
-            "path": "/bin/bash",
-            "args": [
-              "-l"
-            ]
-          },
-          "conda": {
-            "path": "/bin/bash",
-            "args": [
-              "-l",
-              "-c",
-              "source ~/.bashrc && exec bash"
-            ]
-          }
-        }
+        "python.defaultInterpreterPath": "/opt/conda/envs/mdlm/bin/python"
       }
     }
   },
-  // Features to add to the dev container
-  "features": {
-    "ghcr.io/devcontainers/features/git:1": {},
-    "ghcr.io/devcontainers/features/git-lfs:1": {},
-    "ghcr.io/devcontainers/features/github-cli:1": {}
-  },
-  // Configure GPU access for H100
   "runArgs": [
     "--gpus",
-    "device=3",
-    "--shm-size=64g",
+    "all",
     "--network=host",
     "-v",
-    "/mnt/nas/ddalko/mdlm:/workspace/mdlm",
-    "--ulimit",
-    "memlock=-1",
-    "--ulimit",
-    "stack=67108864"
+    "/data/ddalko/mdlm:/workspace/mdlm",
+    "--shm-size=64g"
   ],
   // Environment variables
   "containerEnv": {
@@ -89,37 +39,8 @@
     "PYTHONUNBUFFERED": "1",
     "CUDA_LAUNCH_BLOCKING": "0"
   },
-  // Forward ports for Jupyter, TensorBoard, Wandb
-  "forwardPorts": [
-    8888,
-    6006,
-    8080,
-    7860
-  ],
-  "portsAttributes": {
-    "8888": {
-      "label": "Jupyter Notebook",
-      "onAutoForward": "notify"
-    },
-    "6006": {
-      "label": "TensorBoard",
-      "onAutoForward": "notify"
-    },
-    "8080": {
-      "label": "Wandb Local",
-      "onAutoForward": "ignore"
-    },
-    "7860": {
-      "label": "Gradio/Streamlit",
-      "onAutoForward": "notify"
-    }
-  },
-  // Lifecycle scripts
-  // "postCreateCommand": "chmod +x .devcontainer/setup.sh && .devcontainer/setup.sh",
   // Mount the workspace
   "workspaceFolder": "/workspace/mdlm",
   // Use root user (needed for GPU access)
-  "remoteUser": "root",
-  // Keep container running
-  "shutdownAction": "stopContainer"
+  "remoteUser": "root"
 }
